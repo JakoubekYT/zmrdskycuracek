@@ -1,0 +1,6 @@
+{
+  "name": "Apex Velocity 3D",
+  "description": "3D závodní hra v prohlížeči s realistickou fyzikou přenosu váhy, smyků, odpružení a jednoduchým ovládáním.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
