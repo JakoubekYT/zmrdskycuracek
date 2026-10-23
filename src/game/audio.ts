@@ -202,7 +202,7 @@ export class RaceAudioEngine {
     }
   }
 
-  public playGearShift(isUpShift: boolean): void {
+  public playGearShift(isUpShift = true): void {
     if (this.muted || !this.ctx) return;
     try {
       const now = this.ctx.currentTime;
@@ -269,6 +269,75 @@ export class RaceAudioEngine {
         osc.start(now + idx * 0.09);
         osc.stop(now + idx * 0.09 + 0.28);
       });
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
+   * Realistic F1 pneumatic wheel gun impact wrench sound (rapid torque rattle)
+   */
+  public playWheelGunSound(quality: 'perfect' | 'good' | 'slow'): void {
+    if (this.muted || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      const burstCount = quality === 'perfect' ? 5 : quality === 'good' ? 6 : 8;
+      const step = 0.024;
+      const pitchBase = quality === 'perfect' ? 1400 : quality === 'good' ? 1100 : 750;
+
+      for (let i = 0; i < burstCount; i++) {
+        const t = now + i * step;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(pitchBase + (i % 2 === 0 ? 300 : -150), t);
+        osc.frequency.exponentialRampToValueAtTime(pitchBase * 0.4, t + step * 0.85);
+
+        gain.gain.setValueAtTime(0.07, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + step * 0.9);
+
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(t);
+        osc.stop(t + step);
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  /**
+   * Hydraulic jack release whoosh and solid chassis drop clack
+   */
+  public playJackReleaseSound(): void {
+    if (this.muted || !this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      // Air release hiss/whoosh
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(650, now);
+      osc.frequency.exponentialRampToValueAtTime(95, now + 0.18);
+      gain.gain.setValueAtTime(0.08, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.24);
+
+      // Chassis drop thump
+      const thump = this.ctx.createOscillator();
+      const thumpGain = this.ctx.createGain();
+      thump.type = 'sine';
+      thump.frequency.setValueAtTime(140, now + 0.12);
+      thump.frequency.exponentialRampToValueAtTime(40, now + 0.28);
+      thumpGain.gain.setValueAtTime(0.12, now + 0.12);
+      thumpGain.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
+      thump.connect(thumpGain);
+      thumpGain.connect(this.ctx.destination);
+      thump.start(now + 0.12);
+      thump.stop(now + 0.34);
     } catch {
       // Ignore
     }

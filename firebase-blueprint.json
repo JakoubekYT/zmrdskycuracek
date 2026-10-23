@@ -1,0 +1,174 @@
+{
+  "entities": {
+    "DriverStanding": {
+      "title": "DriverStanding",
+      "description": "Public career Hall of Fame statistics for an authenticated driver.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the driver.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name of the driver.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Public avatar URL from Google profile.",
+          "maxLength": 500
+        },
+        "wins": {
+          "type": "integer",
+          "description": "Total Grand Prix victories."
+        },
+        "racesCompleted": {
+          "type": "integer",
+          "description": "Total completed Grand Prix races."
+        },
+        "podiums": {
+          "type": "integer",
+          "description": "Total top-3 podium finishes."
+        },
+        "bestTrackName": {
+          "type": "string",
+          "description": "Name of circuit where the driver achieved their latest win or record.",
+          "maxLength": 60
+        },
+        "favoriteCarName": {
+          "type": "string",
+          "description": "Most recently driven Formula 1 car name.",
+          "maxLength": 60
+        },
+        "visibility": {
+          "type": "string",
+          "description": "Visibility marker required for public leaderboard queries.",
+          "enum": ["public"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of initial profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last career stat update."
+        }
+      },
+      "required": [
+        "userId",
+        "displayName",
+        "photoURL",
+        "wins",
+        "racesCompleted",
+        "podiums",
+        "bestTrackName",
+        "favoriteCarName",
+        "visibility",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TrackLapRecord": {
+      "title": "TrackLapRecord",
+      "description": "Fastest lap time achieved by an authenticated driver on a specific circuit.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the driver who set the lap record.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Driver display name.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Driver avatar URL.",
+          "maxLength": 500
+        },
+        "trackId": {
+          "type": "string",
+          "description": "Circuit identifier.",
+          "minLength": 1,
+          "maxLength": 40,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "trackName": {
+          "type": "string",
+          "description": "Human-readable circuit name.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "carName": {
+          "type": "string",
+          "description": "Formula 1 car model used for the lap.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "tireCompound": {
+          "type": "string",
+          "description": "Pirelli tire compound used for the lap.",
+          "enum": ["soft", "medium", "hard", "wet"]
+        },
+        "lapTimeMs": {
+          "type": "integer",
+          "description": "Lap duration in milliseconds."
+        },
+        "visibility": {
+          "type": "string",
+          "description": "Visibility marker required for public leaderboard queries.",
+          "enum": ["public"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when record was first created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when record was updated."
+        }
+      },
+      "required": [
+        "userId",
+        "displayName",
+        "photoURL",
+        "trackId",
+        "trackName",
+        "carName",
+        "tireCompound",
+        "lapTimeMs",
+        "visibility",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/hall_of_fame_drivers/{userId}": {
+      "schema": {
+        "$ref": "#/entities/DriverStanding"
+      },
+      "description": "Stores career Hall of Fame statistics (wins, podiums, races completed) per driver UID."
+    },
+    "/hall_of_fame_laps/{recordId}": {
+      "schema": {
+        "$ref": "#/entities/TrackLapRecord"
+      },
+      "description": "Stores personal best lap records per circuit (recordId = userId_trackId)."
+    }
+  }
+}

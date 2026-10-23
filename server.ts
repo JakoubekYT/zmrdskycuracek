@@ -13,6 +13,7 @@ export interface MultiplayerPlayerState {
   name: string;
   carSpecId: string;
   colorHex: number;
+  tireCompound: 'soft' | 'medium' | 'hard' | 'wet';
   isReady: boolean;
   isHost: boolean;
   x: number;
@@ -32,6 +33,14 @@ export interface MultiplayerPlayerState {
   lastSeen: number;
 }
 
+export interface LobbyChatMessage {
+  id: string;
+  senderName: string;
+  senderColorHex: number;
+  text: string;
+  timestamp: number;
+}
+
 export interface LobbyRoom {
   roomId: string;
   hostId: string;
@@ -42,6 +51,7 @@ export interface LobbyRoom {
   status: 'waiting' | 'racing' | 'finished';
   raceStartedAt: number | null;
   players: Map<string, MultiplayerPlayerState>;
+  chatMessages: LobbyChatMessage[];
   createdAt: number;
 }
 
@@ -68,6 +78,7 @@ function serializeRoom(room: LobbyRoom) {
     status: room.status,
     raceStartedAt: room.raceStartedAt,
     players: Array.from(room.players.values()),
+    chatMessages: room.chatMessages.slice(-20),
   };
 }
 
@@ -82,12 +93,12 @@ function broadcastToRoom(wss: WebSocketServer, roomId: string, payload: unknown,
   }
 }
 
-// Cleanup stale rooms every 60s
+// Cleanup stale rooms and disconnected players every 15s
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
     for (const [pid, p] of room.players.entries()) {
-      if (now - p.lastSeen > 45000) {
+      if (pid.startsWith('online-') || now - p.lastSeen > 45000) {
         room.players.delete(pid);
       }
     }
@@ -101,7 +112,7 @@ setInterval(() => {
       }
     }
   }
-}, 30000);
+}, 15000);
 
 async function startServer() {
   const app = express();
@@ -130,6 +141,7 @@ async function startServer() {
       playerName,
       carSpecId,
       colorHex,
+      tireCompound = 'soft',
       trackId = 'alpine-gp',
       totalLaps = 3,
       botCount = 4,
@@ -148,6 +160,9 @@ async function startServer() {
       name: String(playerName || 'Jezdec 1').slice(0, 18),
       carSpecId: String(carSpecId || 'apex-gtr'),
       colorHex: Number(colorHex || 0xef4444),
+      tireCompound: (['soft', 'medium', 'hard', 'wet'].includes(tireCompound)
+        ? tireCompound
+        : 'soft') as 'soft' | 'medium' | 'hard' | 'wet',
       isReady: true,
       isHost: true,
       x: 0,
@@ -177,6 +192,15 @@ async function startServer() {
       status: 'waiting',
       raceStartedAt: null,
       players: new Map([[pid, hostPlayer]]),
+      chatMessages: [
+        {
+          id: `sys-${Date.now()}`,
+          senderName: 'FIA Ředitelství',
+          senderColorHex: 0x38bdf8,
+          text: `Lobby #${roomId} otevřeno. Připravte monoposty a směs pneu!`,
+          timestamp: Date.now(),
+        },
+      ],
       createdAt: Date.now(),
     };
 
@@ -192,7 +216,7 @@ async function startServer() {
       return;
     }
 
-    const { playerId, playerName, carSpecId, colorHex } = req.body || {};
+    const { playerId, playerName, carSpecId, colorHex, tireCompound = 'soft' } = req.body || {};
     const pid = String(playerId || `p-${Math.random().toString(36).slice(2, 9)}`);
 
     // Idempotent join check
@@ -201,13 +225,20 @@ async function startServer() {
       existing.name = String(playerName || existing.name).slice(0, 18);
       existing.carSpecId = String(carSpecId || existing.carSpecId);
       existing.colorHex = Number(colorHex || existing.colorHex);
+      if (['soft', 'medium', 'hard', 'wet'].includes(tireCompound)) {
+        existing.tireCompound = tireCompound;
+      }
       existing.lastSeen = Date.now();
     } else {
+      const joinedName = String(playerName || `Jezdec ${room.players.size + 1}`).slice(0, 18);
       room.players.set(pid, {
         id: pid,
-        name: String(playerName || `Jezdec ${room.players.size + 1}`).slice(0, 18),
+        name: joinedName,
         carSpecId: String(carSpecId || 'apex-gtr'),
         colorHex: Number(colorHex || 0x06b6d4),
+        tireCompound: (['soft', 'medium', 'hard', 'wet'].includes(tireCompound)
+          ? tireCompound
+          : 'soft') as 'soft' | 'medium' | 'hard' | 'wet',
         isReady: true,
         isHost: room.hostId === pid,
         x: 0,
@@ -226,6 +257,13 @@ async function startServer() {
         finishTimeMs: null,
         lastSeen: Date.now(),
       });
+      room.chatMessages.push({
+        id: `join-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        senderName: 'TEAM RADIO',
+        senderColorHex: 0x22c55e,
+        text: `${joinedName} vstoupil do paddocku.`,
+        timestamp: Date.now(),
+      });
     }
 
     const serialized = serializeRoom(room);
@@ -240,12 +278,84 @@ async function startServer() {
       res.status(404).json({ error: 'Lobby nenalezeno' });
       return;
     }
-    const { playerId, stateUpdate, settingsUpdate, action } = req.body || {};
+    const {
+      playerId,
+      state,
+      stateUpdate,
+      playerSetupUpdate,
+      settingsUpdate,
+      action,
+      chatText,
+    } = req.body || {};
+    const incomingState = state || stateUpdate;
     const player = room.players.get(String(playerId));
+    let shouldBroadcastRoomState = false;
+
     if (player) {
       player.lastSeen = Date.now();
-      if (stateUpdate && typeof stateUpdate === 'object') {
-        Object.assign(player, stateUpdate);
+      if (playerSetupUpdate && typeof playerSetupUpdate === 'object') {
+        if (typeof playerSetupUpdate.name === 'string' && playerSetupUpdate.name.trim()) {
+          player.name = playerSetupUpdate.name.trim().slice(0, 18);
+          shouldBroadcastRoomState = true;
+        }
+        if (typeof playerSetupUpdate.carSpecId === 'string') {
+          player.carSpecId = playerSetupUpdate.carSpecId;
+          shouldBroadcastRoomState = true;
+        }
+        if (typeof playerSetupUpdate.colorHex === 'number') {
+          player.colorHex = playerSetupUpdate.colorHex;
+          shouldBroadcastRoomState = true;
+        }
+        if (
+          ['soft', 'medium', 'hard', 'wet'].includes(
+            playerSetupUpdate.tireCompound
+          )
+        ) {
+          player.tireCompound = playerSetupUpdate.tireCompound;
+          shouldBroadcastRoomState = true;
+        }
+      }
+      if (incomingState && typeof incomingState === 'object') {
+        if (typeof incomingState.x === 'number') player.x = incomingState.x;
+        if (typeof incomingState.y === 'number') player.y = incomingState.y;
+        if (typeof incomingState.z === 'number') player.z = incomingState.z;
+        if (typeof incomingState.heading === 'number') player.heading = incomingState.heading;
+        if (typeof incomingState.speedKmh === 'number') player.speedKmh = incomingState.speedKmh;
+        if (typeof incomingState.steerAngle === 'number') player.steerAngle = incomingState.steerAngle;
+        if (typeof incomingState.chassisPitch === 'number') player.chassisPitch = incomingState.chassisPitch;
+        if (typeof incomingState.chassisRoll === 'number') player.chassisRoll = incomingState.chassisRoll;
+        if (typeof incomingState.isDrifting === 'boolean') player.isDrifting = incomingState.isDrifting;
+        if (typeof incomingState.nitroActive === 'boolean') player.nitroActive = incomingState.nitroActive;
+        if (typeof incomingState.lap === 'number') player.lap = incomingState.lap;
+        if (typeof incomingState.totalDistanceDriven === 'number') {
+          player.totalDistanceDriven = incomingState.totalDistanceDriven;
+        }
+        if (typeof incomingState.finished === 'boolean') player.finished = incomingState.finished;
+        if (incomingState.finishTimeMs !== undefined) player.finishTimeMs = incomingState.finishTimeMs;
+        if (['soft', 'medium', 'hard', 'wet'].includes(incomingState.tireCompound)) {
+          if (player.tireCompound !== incomingState.tireCompound) {
+            player.tireCompound = incomingState.tireCompound;
+            shouldBroadcastRoomState = true;
+          }
+        }
+        if (typeof incomingState.carSpecId === 'string' && player.carSpecId !== incomingState.carSpecId) {
+          player.carSpecId = incomingState.carSpecId;
+          shouldBroadcastRoomState = true;
+        }
+        if (typeof incomingState.colorHex === 'number' && player.colorHex !== incomingState.colorHex) {
+          player.colorHex = incomingState.colorHex;
+          shouldBroadcastRoomState = true;
+        }
+      }
+      if (typeof chatText === 'string' && chatText.trim()) {
+        room.chatMessages.push({
+          id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          senderName: player.name,
+          senderColorHex: player.colorHex,
+          text: chatText.trim().slice(0, 120),
+          timestamp: Date.now(),
+        });
+        shouldBroadcastRoomState = true;
       }
     }
     if (settingsUpdate && room.hostId === playerId) {
@@ -253,6 +363,13 @@ async function startServer() {
       if (settingsUpdate.totalLaps !== undefined) room.totalLaps = Number(settingsUpdate.totalLaps);
       if (settingsUpdate.botCount !== undefined) room.botCount = Number(settingsUpdate.botCount);
       if (settingsUpdate.botDifficulty) room.botDifficulty = settingsUpdate.botDifficulty;
+      shouldBroadcastRoomState = true;
+    }
+    if (shouldBroadcastRoomState) {
+      broadcastToRoom(wss, roomId, {
+        type: 'room:state',
+        room: serializeRoom(room),
+      });
     }
     if (action === 'start' && room.hostId === playerId) {
       room.status = 'racing';
@@ -263,6 +380,29 @@ async function startServer() {
       });
     }
     res.json({ room: serializeRoom(room) });
+  });
+
+  app.post('/api/lobbies/:roomId/leave', (req, res) => {
+    const roomId = String(req.params.roomId || '').toUpperCase().trim();
+    const room = rooms.get(roomId);
+    const { playerId } = req.body || {};
+    if (room && playerId) {
+      room.players.delete(String(playerId));
+      if (room.players.size === 0) {
+        rooms.delete(roomId);
+      } else if (room.hostId === playerId) {
+        const nextHost = room.players.values().next().value;
+        if (nextHost) {
+          room.hostId = nextHost.id;
+          nextHost.isHost = true;
+        }
+        broadcastToRoom(wss, roomId, {
+          type: 'room:state',
+          room: serializeRoom(room),
+        });
+      }
+    }
+    res.json({ ok: true });
   });
 
   // WebSocket real-time protocol
@@ -289,6 +429,9 @@ async function startServer() {
               name: String(msg.playerName || `Jezdec ${room.players.size + 1}`).slice(0, 18),
               carSpecId: String(msg.carSpecId || 'apex-gtr'),
               colorHex: Number(msg.colorHex || 0x06b6d4),
+              tireCompound: (['soft', 'medium', 'hard', 'wet'].includes(msg.tireCompound)
+                ? msg.tireCompound
+                : 'soft') as 'soft' | 'medium' | 'hard' | 'wet',
               isReady: true,
               isHost: room.hostId === playerId,
               x: 0,
@@ -313,11 +456,32 @@ async function startServer() {
             if (msg.playerName) player.name = String(msg.playerName).slice(0, 18);
             if (msg.carSpecId) player.carSpecId = String(msg.carSpecId);
             if (msg.colorHex) player.colorHex = Number(msg.colorHex);
+            if (['soft', 'medium', 'hard', 'wet'].includes(msg.tireCompound)) {
+              player.tireCompound = msg.tireCompound;
+            }
           }
 
           const serialized = serializeRoom(room);
           ws.send(JSON.stringify({ type: 'room:state', room: serialized }));
           broadcastToRoom(wss, roomId, { type: 'room:state', room: serialized }, ws);
+        } else if (type === 'room:chat') {
+          const meta = clientSocketMap.get(ws);
+          if (!meta) return;
+          const room = rooms.get(meta.roomId);
+          if (!room) return;
+          const player = room.players.get(meta.playerId);
+          const text = String(msg.text || '').trim().slice(0, 120);
+          if (!text) return;
+          room.chatMessages.push({
+            id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+            senderName: player?.name || String(msg.playerName || 'Jezdec'),
+            senderColorHex: player?.colorHex || 0x38bdf8,
+            text,
+            timestamp: Date.now(),
+          });
+          const serialized = serializeRoom(room);
+          ws.send(JSON.stringify({ type: 'room:state', room: serialized }));
+          broadcastToRoom(wss, meta.roomId, { type: 'room:state', room: serialized }, ws);
         } else if (type === 'room:config') {
           const meta = clientSocketMap.get(ws);
           if (!meta) return;
@@ -377,6 +541,9 @@ async function startServer() {
           }
           if (typeof msg.finished === 'boolean') player.finished = msg.finished;
           if (msg.finishTimeMs !== undefined) player.finishTimeMs = msg.finishTimeMs;
+          if (['soft', 'medium', 'hard', 'wet'].includes(msg.tireCompound)) {
+            player.tireCompound = msg.tireCompound;
+          }
 
           broadcastToRoom(
             wss,
@@ -417,28 +584,8 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      const meta = clientSocketMap.get(ws);
-      if (!meta) return;
+      // Do not immediately delete the player or room on socket close so HTTP /sync and WS reconnects preserve the lobby
       clientSocketMap.delete(ws);
-      const room = rooms.get(meta.roomId);
-      if (room) {
-        room.players.delete(meta.playerId);
-        if (room.players.size === 0) {
-          rooms.delete(meta.roomId);
-        } else {
-          if (room.hostId === meta.playerId) {
-            const nextHost = room.players.values().next().value;
-            if (nextHost) {
-              room.hostId = nextHost.id;
-              nextHost.isHost = true;
-            }
-          }
-          broadcastToRoom(wss, meta.roomId, {
-            type: 'room:state',
-            room: serializeRoom(room),
-          });
-        }
-      }
     });
   });
 

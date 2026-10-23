@@ -1,0 +1,225 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    // Pillar 2: Validation Blueprint for DriverStanding
+    function isValidDriverStanding(data) {
+      return data.keys().hasAll([
+        'userId',
+        'displayName',
+        'photoURL',
+        'wins',
+        'racesCompleted',
+        'podiums',
+        'bestTrackName',
+        'favoriteCarName',
+        'visibility',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'userId',
+        'displayName',
+        'photoURL',
+        'wins',
+        'racesCompleted',
+        'podiums',
+        'bestTrackName',
+        'favoriteCarName',
+        'visibility',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.userId is string &&
+      data.userId.size() >= 1 &&
+      data.userId.size() <= 128 &&
+      data.userId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.userId == request.auth.uid &&
+      data.displayName is string &&
+      data.displayName.size() >= 1 &&
+      data.displayName.size() <= 40 &&
+      data.photoURL is string &&
+      data.photoURL.size() <= 500 &&
+      data.wins is number &&
+      data.wins >= 0 &&
+      data.wins <= 100000 &&
+      data.racesCompleted is number &&
+      data.racesCompleted >= 0 &&
+      data.racesCompleted <= 100000 &&
+      data.podiums is number &&
+      data.podiums >= 0 &&
+      data.podiums <= 100000 &&
+      data.bestTrackName is string &&
+      data.bestTrackName.size() >= 1 &&
+      data.bestTrackName.size() <= 60 &&
+      data.favoriteCarName is string &&
+      data.favoriteCarName.size() >= 1 &&
+      data.favoriteCarName.size() <= 60 &&
+      data.visibility is string &&
+      data.visibility.size() == 6 &&
+      data.visibility == 'public' &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Pillar 2: Validation Blueprint for TrackLapRecord
+    function isValidTrackLapRecord(data) {
+      return data.keys().hasAll([
+        'userId',
+        'displayName',
+        'photoURL',
+        'trackId',
+        'trackName',
+        'carName',
+        'tireCompound',
+        'lapTimeMs',
+        'visibility',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'userId',
+        'displayName',
+        'photoURL',
+        'trackId',
+        'trackName',
+        'carName',
+        'tireCompound',
+        'lapTimeMs',
+        'visibility',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.userId is string &&
+      data.userId.size() >= 1 &&
+      data.userId.size() <= 128 &&
+      data.userId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.userId == request.auth.uid &&
+      data.displayName is string &&
+      data.displayName.size() >= 1 &&
+      data.displayName.size() <= 40 &&
+      data.photoURL is string &&
+      data.photoURL.size() <= 500 &&
+      data.trackId is string &&
+      data.trackId.size() >= 1 &&
+      data.trackId.size() <= 40 &&
+      data.trackId.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.trackName is string &&
+      data.trackName.size() >= 1 &&
+      data.trackName.size() <= 60 &&
+      data.carName is string &&
+      data.carName.size() >= 1 &&
+      data.carName.size() <= 60 &&
+      data.tireCompound is string &&
+      data.tireCompound.size() <= 10 &&
+      data.tireCompound in ['soft', 'medium', 'hard', 'wet'] &&
+      data.lapTimeMs is number &&
+      data.lapTimeMs >= 5000 &&
+      data.lapTimeMs <= 600000 &&
+      data.visibility is string &&
+      data.visibility.size() == 6 &&
+      data.visibility == 'public' &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Collection 1: Career Hall of Fame Standings (Most Wins / Podiums / Races)
+    match /hall_of_fame_drivers/{userId} {
+      allow get: if isValidId(userId) && (resource == null || existing().visibility == 'public');
+      allow list: if existing().visibility == 'public';
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidDriverStanding(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidDriverStanding(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'photoURL',
+            'wins',
+            'racesCompleted',
+            'podiums',
+            'bestTrackName',
+            'favoriteCarName',
+            'visibility',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+    }
+
+    // Collection 2: Circuit Fastest Lap Hall of Fame Records
+    match /hall_of_fame_laps/{recordId} {
+      allow get: if isValidId(recordId) && (resource == null || existing().visibility == 'public');
+      allow list: if existing().visibility == 'public';
+
+      allow create: if isVerifiedUser() &&
+        isValidId(recordId) &&
+        isValidTrackLapRecord(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(recordId) &&
+        isValidTrackLapRecord(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().trackId == existing().trackId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().lapTimeMs <= existing().lapTimeMs &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'photoURL',
+            'trackName',
+            'carName',
+            'tireCompound',
+            'lapTimeMs',
+            'visibility',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+    }
+  }
+}

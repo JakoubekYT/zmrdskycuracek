@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import type { User } from 'firebase/auth';
 import {
   CameraMode,
   computeMinimapData,
@@ -7,15 +8,28 @@ import {
   GameHud,
   GamePhase,
   HudLiveRefs,
+  LobbyChatMessageDTO,
   LobbyRoomDTO,
   MultiplayerPlayerDTO,
   PublicLobbySummary,
   RaceSummarySnapshot,
   StandingEntry,
 } from './components/GameHud';
+import {
+  ensureDriverProfileExists,
+  HallOfFameDriverDoc,
+  HallOfFameLapDoc,
+  recordRaceResultInHallOfFame,
+  recordSingleLapInHallOfFame,
+  signInWithGooglePopup,
+  signOutGoogleUser,
+  subscribeAuthUser,
+  subscribeHallOfFameData,
+} from './firebase';
 import { RaceAudioEngine } from './game/audio';
 import {
   AI_DRIVER_NAMES,
+  AI_STRATEGY_PROFILES,
   BotDifficulty,
   CAR_SPECS,
   CarInput,
@@ -24,8 +38,10 @@ import {
   computeRaceStandings,
   createInitialCarState,
   DEFAULT_TUNING,
+  servicePitStop,
   stepCarPhysics,
   TimeOfDay,
+  TireCompound,
   TuningConfig,
   WeatherType,
 } from './game/physics';
@@ -37,9 +53,13 @@ import {
   createParticlePool,
   createRaceCarMesh,
   createWeatherSystem,
+  initStudioEnvironment,
+  updateCarRigTireCompound,
+  updatePitCrewAnimation,
 } from './game/sceneBuilder';
 import {
   resolveTrackDefinition,
+  sampleTrackByNormalizedT,
   setActiveTrack,
 } from './game/track';
 
@@ -48,6 +68,63 @@ function lerpAngle(current: number, target: number, alpha: number): number {
   while (diff > Math.PI) diff -= Math.PI * 2;
   while (diff < -Math.PI) diff += Math.PI * 2;
   return current + diff * alpha;
+}
+
+const LOCAL_ROOMS_STORAGE_KEY = 'apex_formula_rooms_live_v5';
+
+// Purge any legacy localStorage keys that could hold old demo/seeded players
+try {
+  localStorage.removeItem('apex_formula_rooms_v1');
+  localStorage.removeItem('apex_formula_rooms_v2');
+  localStorage.removeItem('apex_formula_rooms_v3');
+  localStorage.removeItem('apex_formula_rooms_v4');
+} catch {
+  // Ignore
+}
+
+function sanitizeRoomDTO(room: LobbyRoomDTO): LobbyRoomDTO {
+  const realPlayers = (room.players || []).filter(
+    (p) =>
+      p &&
+      typeof p.id === 'string' &&
+      !p.id.startsWith('online-') &&
+      p.name !== 'Tomáš.cz' &&
+      p.name !== 'Marek F1'
+  );
+  return {
+    ...room,
+    players: realPlayers,
+  };
+}
+
+function readLocalRooms(): Record<string, LobbyRoomDTO> {
+  try {
+    const raw = localStorage.getItem(LOCAL_ROOMS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    const cleaned: Record<string, LobbyRoomDTO> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && typeof v === 'object') {
+        const s = sanitizeRoomDTO(v as LobbyRoomDTO);
+        if (s.players.length > 0) {
+          cleaned[k] = s;
+        }
+      }
+    }
+    return cleaned;
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalRoom(room: LobbyRoomDTO): void {
+  try {
+    const all = readLocalRooms();
+    all[room.roomId] = sanitizeRoomDTO(room);
+    localStorage.setItem(LOCAL_ROOMS_STORAGE_KEY, JSON.stringify(all));
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 export default function App() {
@@ -61,17 +138,18 @@ export default function App() {
 
   const [localPlayerId] = useState<string>(() => {
     const saved = sessionStorage.getItem('apex_player_id');
-    if (saved) return saved;
+    if (saved && !saved.startsWith('online-')) return saved;
     const id = `p-${Math.random().toString(36).slice(2, 9)}`;
     sessionStorage.setItem('apex_player_id', id);
     return id;
   });
 
   const [playerName, setPlayerName] = useState<string>(() => {
-    return (
-      localStorage.getItem('apex_player_name') ||
-      `Jezdec ${Math.floor(10 + Math.random() * 89)}`
-    );
+    const saved = localStorage.getItem('apex_player_name');
+    if (saved && !/^Jezdec \d+$/i.test(saved) && saved !== 'Tomáš.cz' && saved !== 'Marek F1') {
+      return saved;
+    }
+    return 'Pilot F1';
   });
 
   const [phase, setPhase] = useState<GamePhase>(
@@ -79,6 +157,8 @@ export default function App() {
   );
   const [selectedTrackId, setSelectedTrackId] = useState<string>('alpine-gp');
   const [selectedCarIdx, setSelectedCarIdx] = useState<number>(0);
+  const [selectedCompound, setSelectedCompound] =
+    useState<TireCompound>('soft');
   const [botCount, setBotCount] = useState<number>(5);
   const [botDifficulty, setBotDifficulty] = useState<BotDifficulty>('medium');
   const [timeOfDay, setTimeOfDay] = useState<TimeOfDay>('day');
@@ -86,7 +166,8 @@ export default function App() {
   const [totalLaps, setTotalLaps] = useState<number>(3);
   const [tuning, setTuning] = useState<TuningConfig>(DEFAULT_TUNING);
   const [cameraMode, setCameraMode] = useState<CameraMode>(
-    initialCamParam && ['chase', 'close', 'hood', 'heli'].includes(initialCamParam)
+    initialCamParam &&
+      ['chase', 'close', 'hood', 'heli'].includes(initialCamParam)
       ? initialCamParam
       : 'chase'
   );
@@ -97,6 +178,14 @@ export default function App() {
   const [lap, setLap] = useState<number>(1);
   const [liveStandings, setLiveStandings] = useState<StandingEntry[]>([]);
   const [summary, setSummary] = useState<RaceSummarySnapshot | null>(null);
+
+  // Firebase Auth & Hall of Fame state
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [hallOfFameDrivers, setHallOfFameDrivers] = useState<
+    HallOfFameDriverDoc[]
+  >([]);
+  const [hallOfFameLaps, setHallOfFameLaps] = useState<HallOfFameLapDoc[]>([]);
+  const authUserRef = useRef<User | null>(null);
 
   // Multiplayer state
   const [activeRoom, setActiveRoom] = useState<LobbyRoomDTO | null>(null);
@@ -110,6 +199,7 @@ export default function App() {
   const phaseRef = useRef<GamePhase>(initialAutostart ? 'playing' : 'title');
   const selectedTrackIdRef = useRef<string>('alpine-gp');
   const selectedCarIdxRef = useRef<number>(0);
+  const selectedCompoundRef = useRef<TireCompound>('soft');
   const botCountRef = useRef<number>(5);
   const botDifficultyRef = useRef<BotDifficulty>('medium');
   const timeOfDayRef = useRef<TimeOfDay>('day');
@@ -118,10 +208,12 @@ export default function App() {
   const tuningRef = useRef<TuningConfig>(DEFAULT_TUNING);
   const cameraModeRef = useRef<CameraMode>(cameraMode);
   const audioRef = useRef<RaceAudioEngine | null>(null);
+  const pitRequestedRef = useRef<boolean>(false);
 
   const activeRoomRef = useRef<LobbyRoomDTO | null>(null);
   const remotePlayersRef = useRef<Map<string, MultiplayerPlayerDTO>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
 
   // Input tracking refs
   const keysHeldRef = useRef<Set<string>>(new Set());
@@ -146,6 +238,9 @@ export default function App() {
   const gearTextRef = useRef<HTMLSpanElement | null>(null);
   const rpmTextRef = useRef<HTMLSpanElement | null>(null);
   const rpmBarRef = useRef<SVGCircleElement | null>(null);
+  const shiftLedStripRefs = useRef<
+    Array<React.RefObject<HTMLSpanElement | null>>
+  >(Array.from({ length: 15 }, () => React.createRef<HTMLSpanElement>()));
   const nitroBarRef = useRef<HTMLDivElement | null>(null);
   const lapTimeTextRef = useRef<HTMLSpanElement | null>(null);
   const bestLapTextRef = useRef<HTMLSpanElement | null>(null);
@@ -155,6 +250,15 @@ export default function App() {
   const gDotRef = useRef<SVGCircleElement | null>(null);
   const frontLoadTextRef = useRef<HTMLSpanElement | null>(null);
   const fpsTextRef = useRef<HTMLSpanElement | null>(null);
+  const tirePctTextRef = useRef<HTMLSpanElement | null>(null);
+  const tireTempTextRef = useRef<HTMLSpanElement | null>(null);
+  const tireBarFillRef = useRef<HTMLDivElement | null>(null);
+  const tireWheelBoxRefs = useRef<Array<React.RefObject<HTMLDivElement | null>>>(
+    Array.from({ length: 4 }, () => React.createRef<HTMLDivElement>())
+  );
+  const pitZoneBannerRef = useRef<HTMLButtonElement | null>(null);
+  const pitStatusBannerRef = useRef<HTMLDivElement | null>(null);
+  const pitStatusTextRef = useRef<HTMLSpanElement | null>(null);
   const playerMapDotRef = useRef<SVGCircleElement | null>(null);
   const playerMapLabelRef = useRef<SVGTextElement | null>(null);
   const rivalDotRefs = useRef<Array<React.RefObject<SVGCircleElement | null>>>(
@@ -169,6 +273,7 @@ export default function App() {
     gearText: gearTextRef,
     rpmText: rpmTextRef,
     rpmBar: rpmBarRef,
+    shiftLedStrip: shiftLedStripRefs.current,
     nitroBar: nitroBarRef,
     lapTimeText: lapTimeTextRef,
     bestLapText: bestLapTextRef,
@@ -178,6 +283,13 @@ export default function App() {
     gDot: gDotRef,
     frontLoadText: frontLoadTextRef,
     fpsText: fpsTextRef,
+    tirePctText: tirePctTextRef,
+    tireTempText: tireTempTextRef,
+    tireBarFill: tireBarFillRef,
+    tireWheelBoxes: tireWheelBoxRefs.current,
+    pitZoneBanner: pitZoneBannerRef,
+    pitStatusBanner: pitStatusBannerRef,
+    pitStatusText: pitStatusTextRef,
     playerMapDot: playerMapDotRef,
     playerMapLabel: playerMapLabelRef,
     rivalMapDots: rivalDotRefs.current,
@@ -188,6 +300,12 @@ export default function App() {
   const refreshAtmosphereRef = useRef<(() => void) | null>(null);
   const rebuildCarsRef = useRef<(() => void) | null>(null);
   const finishEarlyCallbackRef = useRef<(() => void) | null>(null);
+  const triggerPitStopRequestOrEnterRef = useRef<
+    ((forceImmediate?: boolean) => void) | null
+  >(null);
+  const servicePlayerPitStopRef = useRef<
+    ((newCompound: TireCompound, nitroBonus: number) => void) | null
+  >(null);
 
   const updatePhase = useCallback((next: GamePhase) => {
     phaseRef.current = next;
@@ -206,9 +324,80 @@ export default function App() {
     document.body.dataset.state = phaseRef.current;
   }, []);
 
+  // Cross-tab BroadcastChannel for instant zero-fail multiplayer sync
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const bc = new BroadcastChannel('apex_formula_mp_live_v5');
+    broadcastChannelRef.current = bc;
+
+    bc.onmessage = (ev) => {
+      const msg = ev.data;
+      if (!msg || typeof msg !== 'object') return;
+      const currentRoom = activeRoomRef.current;
+
+      if (msg.type === 'room:state' && msg.room) {
+        const incoming = sanitizeRoomDTO(msg.room as LobbyRoomDTO);
+        writeLocalRoom(incoming);
+        if (currentRoom && currentRoom.roomId === incoming.roomId) {
+          const prevCount = currentRoom.players.length;
+          activeRoomRef.current = incoming;
+          setActiveRoom(incoming);
+          for (const p of incoming.players) {
+            if (p.id !== localPlayerIdRef.current) {
+              remotePlayersRef.current.set(p.id, p);
+            }
+          }
+          if (incoming.players.length !== prevCount) {
+            rebuildCarsRef.current?.();
+          }
+        }
+      } else if (
+        msg.type === 'race:started' &&
+        msg.room &&
+        currentRoom &&
+        currentRoom.roomId === msg.room.roomId
+      ) {
+        const room = sanitizeRoomDTO(msg.room as LobbyRoomDTO);
+        activeRoomRef.current = room;
+        setActiveRoom(room);
+        selectedTrackIdRef.current = room.trackId;
+        setSelectedTrackId(room.trackId);
+        rebuildSceneTrackRef.current?.(room.trackId);
+        rebuildCarsRef.current?.();
+        updatePhase('playing');
+      } else if (
+        msg.type === 'player:moved' &&
+        msg.player &&
+        currentRoom &&
+        msg.roomId === currentRoom.roomId
+      ) {
+        const p: MultiplayerPlayerDTO = msg.player;
+        if (
+          p.id !== localPlayerIdRef.current &&
+          !p.id.startsWith('online-') &&
+          p.name !== 'Tomáš.cz' &&
+          p.name !== 'Marek F1'
+        ) {
+          remotePlayersRef.current.set(p.id, p);
+        }
+      }
+    };
+
+    return () => {
+      bc.close();
+      broadcastChannelRef.current = null;
+    };
+  }, [updatePhase]);
+
   // Connect WebSocket for real-time lobby & race sync
   const connectRoomWebSocket = useCallback(
-    (roomId: string, name: string, carSpecId: string, colorHex: number) => {
+    (
+      roomId: string,
+      name: string,
+      carSpecId: string,
+      colorHex: number,
+      tireCompound: TireCompound
+    ) => {
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -228,6 +417,7 @@ export default function App() {
               playerName: name,
               carSpecId,
               colorHex,
+              tireCompound,
             })
           );
         };
@@ -236,10 +426,12 @@ export default function App() {
           try {
             const msg = JSON.parse(String(ev.data));
             if (msg.type === 'room:state' && msg.room) {
-              const room: LobbyRoomDTO = msg.room;
-              const prevPlayerCount = activeRoomRef.current?.players.length ?? 0;
+              const room = sanitizeRoomDTO(msg.room as LobbyRoomDTO);
+              const prevPlayerCount =
+                activeRoomRef.current?.players.length ?? 0;
               activeRoomRef.current = room;
               setActiveRoom(room);
+              writeLocalRoom(room);
 
               if (room.trackId !== selectedTrackIdRef.current) {
                 selectedTrackIdRef.current = room.trackId;
@@ -251,6 +443,7 @@ export default function App() {
                 setBotCount(room.botCount);
               }
 
+              remotePlayersRef.current.clear();
               for (const p of room.players) {
                 if (p.id !== localPlayerIdRef.current) {
                   remotePlayersRef.current.set(p.id, p);
@@ -261,7 +454,7 @@ export default function App() {
                 rebuildCarsRef.current?.();
               }
             } else if (msg.type === 'race:started' && msg.room) {
-              const room: LobbyRoomDTO = msg.room;
+              const room = sanitizeRoomDTO(msg.room as LobbyRoomDTO);
               activeRoomRef.current = room;
               setActiveRoom(room);
               selectedTrackIdRef.current = room.trackId;
@@ -273,7 +466,10 @@ export default function App() {
               updatePhase('playing');
             } else if (msg.type === 'player:moved' && msg.player) {
               const p: MultiplayerPlayerDTO = msg.player;
-              if (p.id !== localPlayerIdRef.current) {
+              if (
+                p.id !== localPlayerIdRef.current &&
+                !p.id.startsWith('online-')
+              ) {
                 remotePlayersRef.current.set(p.id, p);
               }
             }
@@ -282,7 +478,7 @@ export default function App() {
           }
         };
       } catch {
-        // Fallback handled via HTTP sync
+        // Fallback handled via BroadcastChannel & HTTP sync
       }
     },
     [updatePhase]
@@ -291,19 +487,88 @@ export default function App() {
   const handleRefreshLobbies = useCallback(async () => {
     try {
       const res = await fetch('/api/lobbies');
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
-        setPublicLobbies(data.lobbies || []);
+        const serverList: PublicLobbySummary[] = Array.isArray(data.lobbies)
+          ? data.lobbies
+          : [];
+        setPublicLobbies(serverList);
+        return;
       }
     } catch {
-      // Ignore network error
+      // Fallback to local rooms only if backend is unreachable
     }
+    const localRooms = readLocalRooms();
+    const fallbackList = Object.values(localRooms).map((r) => ({
+      roomId: r.roomId,
+      trackId: r.trackId,
+      totalLaps: r.totalLaps,
+      botCount: r.botCount,
+      status: r.status,
+      playerCount: r.players.length,
+      hostName: r.players[0]?.name || 'Host',
+    }));
+    setPublicLobbies(fallbackList);
   }, []);
 
   const handleCreateLobby = useCallback(
     async (customCode?: string) => {
       setLobbyError(null);
       const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
+      const compound = selectedCompoundRef.current;
+      const cleanCode = customCode
+        ? customCode.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6)
+        : '';
+      const fallbackRoomId =
+        cleanCode ||
+        Math.random().toString(36).substring(2, 6).toUpperCase();
+
+      const selfPlayer: MultiplayerPlayerDTO = {
+        id: localPlayerIdRef.current,
+        name: playerNameRef.current || 'Jezdec 1',
+        carSpecId: spec.id,
+        colorHex: spec.colorHex,
+        tireCompound: compound,
+        isReady: true,
+        isHost: true,
+        x: 0,
+        y: 0,
+        z: 0,
+        heading: 0,
+        speedKmh: 0,
+        steerAngle: 0,
+        chassisPitch: 0,
+        chassisRoll: 0,
+        isDrifting: false,
+        nitroActive: false,
+        lap: 1,
+        totalDistanceDriven: 0,
+        finished: false,
+        finishTimeMs: null,
+      };
+
+      let createdRoom: LobbyRoomDTO = {
+        roomId: fallbackRoomId,
+        hostId: localPlayerIdRef.current,
+        trackId: selectedTrackIdRef.current,
+        totalLaps: totalLapsRef.current,
+        botCount: botCountRef.current,
+        botDifficulty: botDifficultyRef.current,
+        status: 'waiting',
+        raceStartedAt: null,
+        players: [selfPlayer],
+        chatMessages: [
+          {
+            id: `sys-${Date.now()}`,
+            senderName: 'FIA Ředitelství',
+            senderColorHex: 0x38bdf8,
+            text: `Lobby #${fallbackRoomId} připraveno. Pozvi soupeře nebo přidej online jezdce!`,
+            timestamp: Date.now(),
+          },
+        ],
+      };
+
       try {
         const res = await fetch('/api/lobbies/create', {
           method: 'POST',
@@ -313,30 +578,40 @@ export default function App() {
             playerName: playerNameRef.current,
             carSpecId: spec.id,
             colorHex: spec.colorHex,
+            tireCompound: compound,
             trackId: selectedTrackIdRef.current,
             totalLaps: totalLapsRef.current,
             botCount: botCountRef.current,
             botDifficulty: botDifficultyRef.current,
-            customRoomId: customCode,
+            customRoomId: cleanCode || undefined,
           }),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          setLobbyError(data.error || 'Chyba při vytváření lobby');
-          return;
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data?.room) {
+            createdRoom = data.room;
+          }
         }
-        activeRoomRef.current = data.room;
-        setActiveRoom(data.room);
-        rebuildCarsRef.current?.();
-        connectRoomWebSocket(
-          data.room.roomId,
-          playerNameRef.current,
-          spec.id,
-          spec.colorHex
-        );
       } catch {
-        setLobbyError('Nepodařilo se spojit se serverem.');
+        // Seamless local + BroadcastChannel fallback
       }
+
+      writeLocalRoom(createdRoom);
+      activeRoomRef.current = createdRoom;
+      setActiveRoom(createdRoom);
+      broadcastChannelRef.current?.postMessage({
+        type: 'room:state',
+        room: createdRoom,
+      });
+      rebuildCarsRef.current?.();
+      connectRoomWebSocket(
+        createdRoom.roomId,
+        playerNameRef.current,
+        spec.id,
+        spec.colorHex,
+        compound
+      );
     },
     [connectRoomWebSocket]
   );
@@ -344,9 +619,15 @@ export default function App() {
   const handleJoinLobby = useCallback(
     async (code: string) => {
       setLobbyError(null);
-      const clean = code.toUpperCase().trim();
-      if (!clean) return;
+      const clean = code.toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
+      if (!clean) {
+        setLobbyError('Zadej prosím kód místnosti (např. 1234).');
+        return;
+      }
       const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
+      const compound = selectedCompoundRef.current;
+
+      let joinedRoom: LobbyRoomDTO | null = null;
       try {
         const res = await fetch(
           `/api/lobbies/${encodeURIComponent(clean)}/join`,
@@ -358,42 +639,333 @@ export default function App() {
               playerName: playerNameRef.current,
               carSpecId: spec.id,
               colorHex: spec.colorHex,
+              tireCompound: compound,
             }),
           }
         );
-        const data = await res.json();
-        if (!res.ok) {
-          setLobbyError(data.error || 'Lobby s tímto ID neexistuje.');
-          return;
-        }
-        const room: LobbyRoomDTO = data.room;
-        activeRoomRef.current = room;
-        setActiveRoom(room);
-        selectedTrackIdRef.current = room.trackId;
-        setSelectedTrackId(room.trackId);
-        botCountRef.current = room.botCount;
-        setBotCount(room.botCount);
-        for (const p of room.players) {
-          if (p.id !== localPlayerIdRef.current) {
-            remotePlayersRef.current.set(p.id, p);
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data?.room) {
+            joinedRoom = data.room;
           }
         }
-        rebuildSceneTrackRef.current?.(room.trackId);
-        rebuildCarsRef.current?.();
-        connectRoomWebSocket(
-          room.roomId,
-          playerNameRef.current,
-          spec.id,
-          spec.colorHex
-        );
       } catch {
-        setLobbyError('Nepodařilo se připojit k lobby.');
+        // Check local / cross-tab room registry
       }
+
+      if (!joinedRoom) {
+        const localRooms = readLocalRooms();
+        const existingLocal = localRooms[clean];
+        const selfPlayer: MultiplayerPlayerDTO = {
+          id: localPlayerIdRef.current,
+          name: playerNameRef.current || 'Jezdec',
+          carSpecId: spec.id,
+          colorHex: spec.colorHex,
+          tireCompound: compound,
+          isReady: true,
+          isHost: !existingLocal,
+          x: 0,
+          y: 0,
+          z: 0,
+          heading: 0,
+          speedKmh: 0,
+          steerAngle: 0,
+          chassisPitch: 0,
+          chassisRoll: 0,
+          isDrifting: false,
+          nitroActive: false,
+          lap: 1,
+          totalDistanceDriven: 0,
+          finished: false,
+          finishTimeMs: null,
+        };
+
+        if (existingLocal) {
+          const others = existingLocal.players.filter(
+            (p) => p.id !== localPlayerIdRef.current
+          );
+          joinedRoom = {
+            ...existingLocal,
+            players: [...others, selfPlayer],
+          };
+        } else {
+          joinedRoom = {
+            roomId: clean,
+            hostId: localPlayerIdRef.current,
+            trackId: selectedTrackIdRef.current,
+            totalLaps: totalLapsRef.current,
+            botCount: botCountRef.current,
+            botDifficulty: botDifficultyRef.current,
+            status: 'waiting',
+            raceStartedAt: null,
+            players: [selfPlayer],
+            chatMessages: [
+              {
+                id: `sys-${Date.now()}`,
+                senderName: 'FIA Ředitelství',
+                senderColorHex: 0x38bdf8,
+                text: `Lobby #${clean} vytvořeno a připojeno.`,
+                timestamp: Date.now(),
+              },
+            ],
+          };
+        }
+      }
+
+      writeLocalRoom(joinedRoom);
+      activeRoomRef.current = joinedRoom;
+      setActiveRoom(joinedRoom);
+      selectedTrackIdRef.current = joinedRoom.trackId;
+      setSelectedTrackId(joinedRoom.trackId);
+      botCountRef.current = joinedRoom.botCount;
+      setBotCount(joinedRoom.botCount);
+      for (const p of joinedRoom.players) {
+        if (p.id !== localPlayerIdRef.current) {
+          remotePlayersRef.current.set(p.id, p);
+        }
+      }
+      broadcastChannelRef.current?.postMessage({
+        type: 'room:state',
+        room: joinedRoom,
+      });
+      rebuildSceneTrackRef.current?.(joinedRoom.trackId);
+      rebuildCarsRef.current?.();
+      connectRoomWebSocket(
+        joinedRoom.roomId,
+        playerNameRef.current,
+        spec.id,
+        spec.colorHex,
+        compound
+      );
     },
     [connectRoomWebSocket]
   );
 
+  // Subscribe to Firebase Auth & Hall of Fame data
+  useEffect(() => {
+    const unsubAuth = subscribeAuthUser((u) => {
+      authUserRef.current = u;
+      setAuthUser(u);
+      if (u) {
+        ensureDriverProfileExists(u).catch(() => {});
+      }
+      if (u?.displayName) {
+        const cleanName = u.displayName.slice(0, 16);
+        playerNameRef.current = cleanName;
+        setPlayerName(cleanName);
+        localStorage.setItem('apex_player_name', cleanName);
+      }
+    });
+    const unsubHof = subscribeHallOfFameData(
+      (drivers) => setHallOfFameDrivers(drivers),
+      (laps) => setHallOfFameLaps(laps)
+    );
+    return () => {
+      unsubAuth();
+      unsubHof();
+    };
+  }, []);
+
+  const handleSignInGoogle = useCallback(async () => {
+    try {
+      await signInWithGooglePopup();
+    } catch {
+      // Popup closed by user
+    }
+  }, []);
+
+  const handleSignOutGoogle = useCallback(async () => {
+    try {
+      await signOutGoogleUser();
+    } catch {
+      // Ignore
+    }
+  }, []);
+
+  // Helper to sync lobby changes via WS + BroadcastChannel + HTTP
+  const syncActiveLobbySetup = useCallback(
+    (
+      updatedRoom: LobbyRoomDTO,
+      playerSetupUpdate?: {
+        name?: string;
+        carSpecId?: string;
+        colorHex?: number;
+        tireCompound?: TireCompound;
+      },
+      settingsUpdate?: {
+        trackId?: string;
+        totalLaps?: number;
+        botCount?: number;
+        botDifficulty?: BotDifficulty;
+      }
+    ) => {
+      activeRoomRef.current = updatedRoom;
+      setActiveRoom(updatedRoom);
+      writeLocalRoom(updatedRoom);
+      broadcastChannelRef.current?.postMessage({
+        type: 'room:state',
+        room: updatedRoom,
+      });
+
+      const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        if (playerSetupUpdate) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'room:join',
+              roomId: updatedRoom.roomId,
+              playerId: localPlayerIdRef.current,
+              playerName: playerNameRef.current,
+              carSpecId: spec.id,
+              colorHex: spec.colorHex,
+              tireCompound: selectedCompoundRef.current,
+            })
+          );
+        }
+        if (settingsUpdate) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'room:config',
+              ...settingsUpdate,
+            })
+          );
+        }
+      }
+
+      fetch(`/api/lobbies/${updatedRoom.roomId}/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId: localPlayerIdRef.current,
+          playerSetupUpdate,
+          settingsUpdate,
+        }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data?.room) {
+            activeRoomRef.current = data.room;
+            setActiveRoom(data.room);
+            writeLocalRoom(data.room);
+          }
+        })
+        .catch(() => {});
+    },
+    []
+  );
+
+  // Poll active lobby every 1.2s while waiting in Paddock so all players see real-time compound & AI bot changes
+  useEffect(() => {
+    if (phase !== 'title') return;
+    if (!activeRoom) {
+      handleRefreshLobbies();
+      const pubTimer = window.setInterval(() => {
+        handleRefreshLobbies();
+      }, 2500);
+      return () => window.clearInterval(pubTimer);
+    }
+    const timer = window.setInterval(() => {
+      const current = activeRoomRef.current;
+      if (!current) return;
+      fetch(`/api/lobbies/${current.roomId}/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId: localPlayerIdRef.current }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data?.room) {
+            const incoming = sanitizeRoomDTO(data.room as LobbyRoomDTO);
+            activeRoomRef.current = incoming;
+            setActiveRoom(incoming);
+            writeLocalRoom(incoming);
+            if (incoming.trackId !== selectedTrackIdRef.current) {
+              selectedTrackIdRef.current = incoming.trackId;
+              setSelectedTrackId(incoming.trackId);
+              rebuildSceneTrackRef.current?.(incoming.trackId);
+            }
+            if (incoming.botCount !== botCountRef.current) {
+              botCountRef.current = incoming.botCount;
+              setBotCount(incoming.botCount);
+            }
+            if (incoming.botDifficulty !== botDifficultyRef.current) {
+              botDifficultyRef.current = incoming.botDifficulty;
+              setBotDifficulty(incoming.botDifficulty);
+            }
+            if (incoming.totalLaps !== totalLapsRef.current) {
+              totalLapsRef.current = incoming.totalLaps;
+              setTotalLaps(incoming.totalLaps);
+            }
+            rebuildCarsRef.current?.();
+            if (incoming.status === 'racing' && phaseRef.current === 'title') {
+              updatePhase('playing');
+            }
+          }
+        })
+        .catch(() => {});
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [activeRoom, phase, updatePhase, handleRefreshLobbies]);
+
+  const handleQuickMatchLobby = useCallback(async () => {
+    if (publicLobbies.length > 0) {
+      await handleJoinLobby(publicLobbies[0].roomId);
+    } else {
+      await handleCreateLobby('GPF1');
+    }
+  }, [publicLobbies, handleJoinLobby, handleCreateLobby]);
+
+  const handleSendLobbyChat = useCallback((text: string) => {
+    const room = activeRoomRef.current;
+    if (!room || !text.trim()) return;
+    const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
+    const newMsg: LobbyChatMessageDTO = {
+      id: `msg-${Date.now()}`,
+      senderName: playerNameRef.current,
+      senderColorHex: spec.colorHex,
+      text: text.trim().slice(0, 120),
+      timestamp: Date.now(),
+    };
+    const updated: LobbyRoomDTO = {
+      ...room,
+      chatMessages: [...(room.chatMessages || []), newMsg].slice(-20),
+    };
+    activeRoomRef.current = updated;
+    setActiveRoom(updated);
+    writeLocalRoom(updated);
+    broadcastChannelRef.current?.postMessage({
+      type: 'room:state',
+      room: updated,
+    });
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'room:chat',
+          playerName: playerNameRef.current,
+          text: newMsg.text,
+        })
+      );
+    }
+    fetch(`/api/lobbies/${room.roomId}/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        playerId: localPlayerIdRef.current,
+        chatText: newMsg.text,
+      }),
+    }).catch(() => {});
+  }, []);
+
   const handleLeaveLobby = useCallback(() => {
+    const room = activeRoomRef.current;
+    if (room) {
+      fetch(`/api/lobbies/${room.roomId}/leave`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId: localPlayerIdRef.current }),
+      }).catch(() => {});
+    }
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'room:leave' }));
       wsRef.current.close();
@@ -414,14 +986,25 @@ export default function App() {
   }, [initialRoomParam, handleJoinLobby]);
 
   const handleStartRace = useCallback(() => {
-    if (
-      activeRoomRef.current &&
-      activeRoomRef.current.hostId === localPlayerIdRef.current
-    ) {
+    pitRequestedRef.current = false;
+    if (activeRoomRef.current) {
+      const updatedRoom: LobbyRoomDTO = {
+        ...activeRoomRef.current,
+        status: 'racing',
+        raceStartedAt: Date.now(),
+      };
+      activeRoomRef.current = updatedRoom;
+      setActiveRoom(updatedRoom);
+      writeLocalRoom(updatedRoom);
+      broadcastChannelRef.current?.postMessage({
+        type: 'race:started',
+        room: updatedRoom,
+      });
+
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'race:start' }));
       }
-      fetch(`/api/lobbies/${activeRoomRef.current.roomId}/sync`, {
+      fetch(`/api/lobbies/${updatedRoom.roomId}/sync`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -435,6 +1018,7 @@ export default function App() {
   }, [updatePhase]);
 
   const handleRestartRace = useCallback(() => {
+    pitRequestedRef.current = false;
     rebuildCarsRef.current?.();
     updatePhase('playing');
   }, [updatePhase]);
@@ -447,26 +1031,51 @@ export default function App() {
     }
   }, [updatePhase]);
 
+  const handleEnterPitStop = useCallback(() => {
+    triggerPitStopRequestOrEnterRef.current?.(false);
+  }, []);
+
+  const handleForceOpenPitStop = useCallback(() => {
+    triggerPitStopRequestOrEnterRef.current?.(true);
+  }, []);
+
+  const handleCompletePitStop = useCallback(
+    (newCompound: TireCompound, nitroBonus: number) => {
+      selectedCompoundRef.current = newCompound;
+      setSelectedCompound(newCompound);
+      pitRequestedRef.current = false;
+      servicePlayerPitStopRef.current?.(newCompound, nitroBonus);
+      updatePhase('playing');
+    },
+    [updatePhase]
+  );
+
   const handleReturnTitle = useCallback(() => {
+    pitRequestedRef.current = false;
     rebuildCarsRef.current?.();
     updatePhase('title');
   }, [updatePhase]);
 
-  const handleSelectTrack = useCallback((trackId: string) => {
-    selectedTrackIdRef.current = trackId;
-    setSelectedTrackId(trackId);
-    rebuildSceneTrackRef.current?.(trackId);
-    rebuildCarsRef.current?.();
+  const handleSelectTrack = useCallback(
+    (trackId: string) => {
+      selectedTrackIdRef.current = trackId;
+      setSelectedTrackId(trackId);
+      rebuildSceneTrackRef.current?.(trackId);
+      rebuildCarsRef.current?.();
 
-    if (
-      activeRoomRef.current &&
-      activeRoomRef.current.hostId === localPlayerIdRef.current
-    ) {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'room:config', trackId }));
+      if (
+        activeRoomRef.current &&
+        activeRoomRef.current.hostId === localPlayerIdRef.current
+      ) {
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          trackId,
+        };
+        syncActiveLobbySetup(updatedRoom, undefined, { trackId });
       }
-    }
-  }, []);
+    },
+    [syncActiveLobbySetup]
+  );
 
   const handleGenerateRandomTrack = useCallback(() => {
     const randomSeed = Math.floor(1000 + Math.random() * 9000);
@@ -486,46 +1095,108 @@ export default function App() {
     refreshAtmosphereRef.current?.();
   }, []);
 
-  const handleSelectCar = useCallback((idx: number) => {
-    selectedCarIdxRef.current = idx;
-    setSelectedCarIdx(idx);
-    rebuildCarsRef.current?.();
+  const handleSelectCar = useCallback(
+    (idx: number) => {
+      selectedCarIdxRef.current = idx;
+      setSelectedCarIdx(idx);
+      rebuildCarsRef.current?.();
 
-    const spec = CAR_SPECS[idx] || CAR_SPECS[0];
-    if (activeRoomRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'room:join',
-          roomId: activeRoomRef.current.roomId,
-          playerId: localPlayerIdRef.current,
-          playerName: playerNameRef.current,
+      const spec = CAR_SPECS[idx] || CAR_SPECS[0];
+      if (activeRoomRef.current) {
+        const updatedPlayers = activeRoomRef.current.players.map((p) =>
+          p.id === localPlayerIdRef.current
+            ? { ...p, carSpecId: spec.id, colorHex: spec.colorHex }
+            : p
+        );
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          players: updatedPlayers,
+        };
+        syncActiveLobbySetup(updatedRoom, {
           carSpecId: spec.id,
           colorHex: spec.colorHex,
-        })
-      );
-    }
-  }, []);
-
-  const handleChangeBotCount = useCallback((cnt: number) => {
-    botCountRef.current = cnt;
-    setBotCount(cnt);
-    rebuildCarsRef.current?.();
-    if (
-      activeRoomRef.current &&
-      activeRoomRef.current.hostId === localPlayerIdRef.current
-    ) {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({ type: 'room:config', botCount: cnt })
-        );
+        });
       }
-    }
-  }, []);
+    },
+    [syncActiveLobbySetup]
+  );
 
-  const handleChangeBotDifficulty = useCallback((diff: BotDifficulty) => {
-    botDifficultyRef.current = diff;
-    setBotDifficulty(diff);
-  }, []);
+  const handleSelectCompound = useCallback(
+    (compound: TireCompound) => {
+      selectedCompoundRef.current = compound;
+      setSelectedCompound(compound);
+      rebuildCarsRef.current?.();
+
+      if (activeRoomRef.current) {
+        const updatedPlayers = activeRoomRef.current.players.map((p) =>
+          p.id === localPlayerIdRef.current
+            ? { ...p, tireCompound: compound }
+            : p
+        );
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          players: updatedPlayers,
+        };
+        syncActiveLobbySetup(updatedRoom, { tireCompound: compound });
+      }
+    },
+    [syncActiveLobbySetup]
+  );
+
+  const handleChangeBotCount = useCallback(
+    (cnt: number) => {
+      botCountRef.current = cnt;
+      setBotCount(cnt);
+      rebuildCarsRef.current?.();
+      if (
+        activeRoomRef.current &&
+        activeRoomRef.current.hostId === localPlayerIdRef.current
+      ) {
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          botCount: cnt,
+        };
+        syncActiveLobbySetup(updatedRoom, undefined, { botCount: cnt });
+      }
+    },
+    [syncActiveLobbySetup]
+  );
+
+  const handleChangeBotDifficulty = useCallback(
+    (diff: BotDifficulty) => {
+      botDifficultyRef.current = diff;
+      setBotDifficulty(diff);
+      if (
+        activeRoomRef.current &&
+        activeRoomRef.current.hostId === localPlayerIdRef.current
+      ) {
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          botDifficulty: diff,
+        };
+        syncActiveLobbySetup(updatedRoom, undefined, { botDifficulty: diff });
+      }
+    },
+    [syncActiveLobbySetup]
+  );
+
+  const handleChangeTotalLaps = useCallback(
+    (laps: number) => {
+      totalLapsRef.current = laps;
+      setTotalLaps(laps);
+      if (
+        activeRoomRef.current &&
+        activeRoomRef.current.hostId === localPlayerIdRef.current
+      ) {
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          totalLaps: laps,
+        };
+        syncActiveLobbySetup(updatedRoom, undefined, { totalLaps: laps });
+      }
+    },
+    [syncActiveLobbySetup]
+  );
 
   const handleChangeTuning = useCallback((next: TuningConfig) => {
     tuningRef.current = next;
@@ -558,25 +1229,25 @@ export default function App() {
     []
   );
 
-  const handleChangePlayerName = useCallback((name: string) => {
-    playerNameRef.current = name;
-    setPlayerName(name);
-    localStorage.setItem('apex_player_name', name);
+  const handleChangePlayerName = useCallback(
+    (name: string) => {
+      playerNameRef.current = name;
+      setPlayerName(name);
+      localStorage.setItem('apex_player_name', name);
 
-    const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
-    if (activeRoomRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'room:join',
-          roomId: activeRoomRef.current.roomId,
-          playerId: localPlayerIdRef.current,
-          playerName: name,
-          carSpecId: spec.id,
-          colorHex: spec.colorHex,
-        })
-      );
-    }
-  }, []);
+      if (activeRoomRef.current) {
+        const updatedPlayers = activeRoomRef.current.players.map((p) =>
+          p.id === localPlayerIdRef.current ? { ...p, name } : p
+        );
+        const updatedRoom = {
+          ...activeRoomRef.current,
+          players: updatedPlayers,
+        };
+        syncActiveLobbySetup(updatedRoom, { name });
+      }
+    },
+    [syncActiveLobbySetup]
+  );
 
   // Initialize Three.js WebGL scene and simulation loop strictly ONCE
   useEffect(() => {
@@ -602,9 +1273,9 @@ export default function App() {
 
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.08;
+    renderer.toneMappingExposure = 1.1;
     renderer.setPixelRatio(
-      isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.5)
+      isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 1.65)
     );
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.shadowMap.enabled = false;
@@ -613,21 +1284,20 @@ export default function App() {
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
+    initStudioEnvironment(renderer, scene);
 
-    // Balanced Warm/Cool Lighting Rig
-    const hemiLight = new THREE.HemisphereLight(0x93c5fd, 0x1e293b, 0.95);
+    const hemiLight = new THREE.HemisphereLight(0x93c5fd, 0x1e293b, 0.98);
     scene.add(hemiLight);
 
-    const sunLight = new THREE.DirectionalLight(0xfff4d6, 1.85);
+    const sunLight = new THREE.DirectionalLight(0xfff4d6, 1.95);
     sunLight.position.set(85, 120, -60);
     scene.add(sunLight);
 
-    // Near plane 0.12 ensures the 3D cockpit steering wheel & driver hands at 0.25-0.45m never clip
     const camera = new THREE.PerspectiveCamera(
       62,
       window.innerWidth / window.innerHeight,
       0.12,
-      520
+      540
     );
 
     let currentTrackGroup: THREE.Group | null = null;
@@ -675,7 +1345,6 @@ export default function App() {
     let carRigs: CarRig[] = [];
     let maxPlayerSpeedKmh = 0;
 
-    // Camera state locked relative to car to eliminate world-space lerp jitter
     let smoothCamYaw = 0;
     let smoothSpeedBackOffset = 0;
     let smoothLateralCamOffset = 0;
@@ -688,17 +1357,20 @@ export default function App() {
       maxPlayerSpeedKmh = 0;
 
       const playerSpec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
+      const playerCompound = selectedCompoundRef.current;
+
       const playerState = createInitialCarState(
         localPlayerIdRef.current,
         playerNameRef.current,
         true,
         playerSpec,
         0.004,
-        -2.8
+        -2.8,
+        playerCompound
       );
 
       cars = [playerState];
-      const playerRig = createRaceCarMesh(playerSpec);
+      const playerRig = createRaceCarMesh(playerSpec, undefined, playerCompound);
       playerRig.root.position.set(playerState.x, playerState.y, playerState.z);
       playerRig.root.rotation.y = playerState.heading;
       scene.add(playerRig.root);
@@ -716,7 +1388,8 @@ export default function App() {
           if (rp.id === localPlayerIdRef.current) continue;
           const rpSpec =
             CAR_SPECS.find((s) => s.id === rp.carSpecId) || CAR_SPECS[1];
-          const startT = 0.004 + gridSlot * 0.0065;
+          const rpCompound = rp.tireCompound || 'soft';
+          const startT = 0.004 + gridSlot * 0.0055;
           const lat = gridSlot % 2 === 1 ? 2.8 : -2.8;
           const rState = createInitialCarState(
             rp.id,
@@ -724,12 +1397,13 @@ export default function App() {
             false,
             rpSpec,
             startT,
-            lat
+            lat,
+            rpCompound
           );
           rState.isRemote = true;
           cars.push(rState);
 
-          const rRig = createRaceCarMesh(rpSpec, rp.name);
+          const rRig = createRaceCarMesh(rpSpec, rp.name, rpCompound);
           rRig.root.position.set(rState.x, rState.y, rState.z);
           rRig.root.rotation.y = rState.heading;
           scene.add(rRig.root);
@@ -738,13 +1412,18 @@ export default function App() {
         }
       }
 
-      // Add AI Bots
+      // Add AI Formula Bots with Individual Racing & Pit Stop Strategies
       const numBots = botCountRef.current;
       for (let b = 0; b < numBots; b++) {
         const aiSpec =
           CAR_SPECS[(selectedCarIdxRef.current + b + 1) % CAR_SPECS.length];
         const aiName = AI_DRIVER_NAMES[b % AI_DRIVER_NAMES.length];
-        const startT = 0.004 + gridSlot * 0.0065;
+        const aiProf = AI_STRATEGY_PROFILES[b % AI_STRATEGY_PROFILES.length];
+        const aiCompound =
+          weatherRef.current === 'rain' || weatherRef.current === 'snow'
+            ? 'wet'
+            : aiProf.startingCompound;
+        const startT = 0.004 + gridSlot * 0.0055;
         const lat = gridSlot % 2 === 1 ? 2.8 : -2.8;
         const aiState = createInitialCarState(
           `ai-${b}`,
@@ -752,11 +1431,13 @@ export default function App() {
           false,
           aiSpec,
           startT,
-          lat
+          lat,
+          aiCompound,
+          b
         );
         cars.push(aiState);
 
-        const aiRig = createRaceCarMesh(aiSpec, aiName);
+        const aiRig = createRaceCarMesh(aiSpec, aiName, aiCompound);
         aiRig.root.position.set(aiState.x, aiState.y, aiState.z);
         aiRig.root.rotation.y = aiState.heading;
         scene.add(aiRig.root);
@@ -776,12 +1457,93 @@ export default function App() {
           colorHex: c.spec.colorHex,
           speedKmh: c.speedKmh,
           lap: c.lap,
+          tireCompound: c.tireCompound,
+          tireHealth: c.tireHealth,
+          inPitBox: c.inPitBox,
+          inPitLaneAlley: c.inPitLaneAlley,
+          pitStopsCompleted: c.pitStopsCompleted,
+          aiStrategyName: c.aiStrategyName,
+          finished: c.finished,
+          finishTimeMs: c.finishTimeMs,
         }))
       );
     }
 
     rebuildCars();
     rebuildCarsRef.current = rebuildCars;
+
+    function pullPlayerIntoPitStall() {
+      const player = cars[0];
+      const playerRig = carRigs[0];
+      if (!player || !playerRig) return;
+      const trackDef = resolveTrackDefinition(selectedTrackIdRef.current);
+      const pitStallSample = sampleTrackByNormalizedT(
+        0.0,
+        selectedTrackIdRef.current
+      );
+      // Place car at the exact 3D Pit Crew stall inside the right-side Pit Lane Alley
+      const pitLat = trackDef.roadHalfWidth + 3.15;
+      player.x =
+        pitStallSample.x +
+        pitStallSample.nx * pitLat -
+        pitStallSample.tx * 5.0;
+      player.y = 0;
+      player.z =
+        pitStallSample.z +
+        pitStallSample.nz * pitLat -
+        pitStallSample.tz * 5.0;
+      player.heading = pitStallSample.angle;
+      player.vx = 0;
+      player.vz = 0;
+      player.forwardSpeed = 0;
+      player.lateralSpeed = 0;
+      player.speedKmh = 0;
+      player.inPitZone = true;
+      player.inPitLaneAlley = true;
+      player.inPitBox = true;
+      playerRig.root.position.set(player.x, player.y, player.z);
+      playerRig.root.rotation.y = player.heading;
+    }
+
+    triggerPitStopRequestOrEnterRef.current = (forceImmediate = false) => {
+      const player = cars[0];
+      if (!player) return;
+      // Strict physical Pit Stop rule:
+      // While driving on track, pressing [B] ONLY enters the Pit Stop if the car is physically inside the Pit Lane Alley / Pit Box!
+      // Otherwise it toggles the Team Radio Pit Request ("BOX THIS LAP").
+      if (
+        forceImmediate ||
+        player.inPitBox ||
+        player.inPitLaneAlley ||
+        phaseRef.current === 'paused'
+      ) {
+        pitRequestedRef.current = false;
+        pullPlayerIntoPitStall();
+        updatePhase('pitstop');
+      } else {
+        pitRequestedRef.current = !pitRequestedRef.current;
+        audio.playGearShift();
+      }
+    };
+
+    servicePlayerPitStopRef.current = (
+      newCompound: TireCompound,
+      nitroBonus: number
+    ) => {
+      const player = cars[0];
+      const playerRig = carRigs[0];
+      if (!player || !playerRig) return;
+      servicePitStop(player, newCompound, nitroBonus);
+      updateCarRigTireCompound(playerRig, newCompound);
+      // Launch car cleanly out of the Pit Lane Alley at 115 km/h
+      const sinH = Math.sin(player.heading);
+      const cosH = Math.cos(player.heading);
+      player.forwardSpeed = 31.9;
+      player.vx = sinH * 31.9;
+      player.vz = cosH * 31.9;
+      player.speedKmh = 115;
+      audio.playLapComplete(false);
+    };
 
     finishEarlyCallbackRef.current = () => {
       const player = cars[0];
@@ -793,10 +1555,11 @@ export default function App() {
       setSummary({
         position: pos,
         totalCars: cars.length,
-        totalTimeMs: player.currentLapTimeMs,
+        totalTimeMs: player.finishTimeMs ?? player.totalRaceTimeMs,
         bestLapMs: player.bestLapTimeMs ?? player.currentLapTimeMs,
         maxSpeedKmh: Math.max(maxPlayerSpeedKmh, player.speedKmh),
         driftScore: player.driftScore,
+        pitStopsCompleted: player.pitStopsCompleted,
         carName: player.spec.name,
         trackName: trackDef.name,
         standings: standings.map((c) => ({
@@ -804,6 +1567,11 @@ export default function App() {
           isPlayer: c.isPlayer,
           speedKmh: c.speedKmh,
           lap: c.lap,
+          tireCompound: c.tireCompound,
+          pitStopsCompleted: c.pitStopsCompleted,
+          aiStrategyName: c.aiStrategyName,
+          finished: c.finished,
+          finishTimeMs: c.finishTimeMs,
         })),
       });
       audio.playLapComplete(pos === 1);
@@ -842,6 +1610,11 @@ export default function App() {
       }
 
       if (phaseRef.current === 'playing') {
+        if (code === 'KeyB') {
+          e.preventDefault();
+          triggerPitStopRequestOrEnterRef.current?.(false);
+          return;
+        }
         if (code === 'KeyC') {
           e.preventDefault();
           const order: CameraMode[] = ['chase', 'close', 'hood', 'heli'];
@@ -862,6 +1635,7 @@ export default function App() {
         }
         if (code === 'KeyR') {
           e.preventDefault();
+          pitRequestedRef.current = false;
           rebuildCars();
           return;
         }
@@ -963,19 +1737,19 @@ export default function App() {
       player.name = playerNameRef.current;
 
       const camMode = cameraModeRef.current;
+      const isCockpitView = currentPhase !== 'title' && camMode === 'hood';
       const showHeadlights =
         timeOfDayRef.current === 'night' ||
         timeOfDayRef.current === 'sunset' ||
         weatherRef.current === 'rain' ||
         weatherRef.current === 'fog';
 
-      // Show only the hero car during Title Screen showcase
       for (let i = 1; i < carRigs.length; i++) {
         carRigs[i].root.visible = currentPhase !== 'title';
       }
       if (carRigs[0]) {
-        carRigs[0].cockpitGroup.visible =
-          currentPhase !== 'title' && camMode === 'hood';
+        carRigs[0].exteriorBodyMesh.visible = !isCockpitView;
+        carRigs[0].cockpitGroup.visible = isCockpitView;
         carRigs[0].headlightBeamGroup.visible = showHeadlights;
       }
 
@@ -983,14 +1757,15 @@ export default function App() {
         titleOrbitAngle += dt * 0.38;
         const sway = Math.sin(titleOrbitAngle) * 0.75;
         camera.position.set(
-          player.x - 4.7,
-          player.y + 1.82,
-          player.z + 4.8 + sway
+          player.x - 4.5,
+          player.y + 1.68,
+          player.z + 4.7 + sway
         );
-        camera.lookAt(player.x + 1.8, player.y + 0.62, player.z - 0.5);
+        camera.lookAt(player.x + 1.7, player.y + 0.55, player.z - 0.4);
         for (const w of carRigs[0].wheelMeshes) {
           w.rotation.x += dt * 2.5;
         }
+        updatePitCrewAnimation(currentTrackGroup, false, now * 0.001);
         weatherSystem.update(
           dt,
           camera.position.x,
@@ -998,7 +1773,7 @@ export default function App() {
           camera.position.z,
           weatherRef.current
         );
-        audio.updateEngine(1100, 0, false, 0, false, false, false);
+        audio.updateEngine(1100, 0, false, 0, false, false, 1, false);
       } else if (currentPhase === 'playing') {
         const held = keysHeldRef.current;
         const touch = touchHeldRef.current;
@@ -1046,6 +1821,20 @@ export default function App() {
           weatherGripMult
         );
 
+        // PHYSICAL DRIVE-IN PIT LANE ALLEY CHECK:
+        // Trigger Pit Stop Minigame ONLY when the player physically drives into the Pit Box inside the Pit Lane Alley,
+        // or when Pit Request is active and the player steers into the Pit Lane Alley!
+        if (
+          player.inPitBox ||
+          (pitRequestedRef.current &&
+            player.inPitLaneAlley &&
+            player.pitExitCooldown <= 0)
+        ) {
+          pitRequestedRef.current = false;
+          pullPlayerIntoPitStall();
+          updatePhase('pitstop');
+        }
+
         if (player.gear !== prevPlayerGear) {
           prevPlayerGear = player.gear;
           audio.playGearShift();
@@ -1079,6 +1868,17 @@ export default function App() {
         if (player.lap !== prevPlayerLap) {
           prevPlayerLap = player.lap;
           audio.playLapComplete(false);
+          if (authUserRef.current && player.bestLapTimeMs) {
+            const trackDef = resolveTrackDefinition(selectedTrackIdRef.current);
+            recordSingleLapInHallOfFame(
+              authUserRef.current,
+              trackDef.id,
+              trackDef.name,
+              player.bestLapTimeMs,
+              player.spec.name,
+              player.tireCompound
+            ).catch(() => {});
+          }
         }
 
         // Update Remote Online Players & AI Bots
@@ -1096,6 +1896,9 @@ export default function App() {
             if (netState) {
               const lerpFactor = 1 - Math.exp(-15 * dt);
               c.x += (netState.x - c.x) * lerpFactor;
+              if (typeof netState.y === 'number') {
+                c.y += (netState.y - c.y) * lerpFactor;
+              }
               c.z += (netState.z - c.z) * lerpFactor;
               c.heading = netState.heading;
               c.speedKmh = netState.speedKmh;
@@ -1106,9 +1909,22 @@ export default function App() {
               c.nitroActive = netState.nitroActive;
               c.lap = netState.lap;
               c.totalDistanceDriven = netState.totalDistanceDriven;
+              c.unwrappedProgress = netState.totalDistanceDriven / 1200;
+              c.finished = Boolean(netState.finished);
+              if (netState.finishTimeMs !== undefined) {
+                c.finishTimeMs = netState.finishTimeMs;
+              }
+              if (
+                netState.tireCompound &&
+                netState.tireCompound !== c.tireCompound
+              ) {
+                c.tireCompound = netState.tireCompound;
+                if (carRigs[i]) {
+                  updateCarRigTireCompound(carRigs[i], netState.tireCompound);
+                }
+              }
               c.wheelRotation += (c.speedKmh / 3.6 / 0.34) * dt;
 
-              // Update remote player's nameplate if their nickname changed
               if (netState.name && netState.name !== c.name) {
                 c.name = netState.name;
                 const rig = carRigs[i];
@@ -1125,9 +1941,10 @@ export default function App() {
               }
             }
           } else {
+            const prevAiCompound = c.tireCompound;
             const laneOff = ((i % 3) - 1) * 2.8;
             const pace = baseDiffPace - (i % 4) * 0.025;
-            const aiIn = computeAiInput(c, laneOff, pace);
+            const aiIn = computeAiInput(c, laneOff, pace, weatherRef.current);
             stepCarPhysics(
               c,
               aiIn,
@@ -1136,6 +1953,9 @@ export default function App() {
               totalLapsRef.current,
               weatherGripMult
             );
+            if (c.tireCompound !== prevAiCompound && carRigs[i]) {
+              updateCarRigTireCompound(carRigs[i], c.tireCompound);
+            }
           }
         }
 
@@ -1183,11 +2003,14 @@ export default function App() {
           }
         }
 
-        // Emit local player state to WebSocket room at 20Hz + periodic HTTP fallback
+        // Emit local player state to WebSocket, BroadcastChannel & HTTP Sync
         if (activeRoomRef.current && now - lastNetworkEmitTime > 50) {
           lastNetworkEmitTime = now;
           const payload = {
             type: 'player:update',
+            id: localPlayerIdRef.current,
+            name: playerNameRef.current,
+            tireCompound: player.tireCompound,
             x: player.x,
             y: player.y,
             z: player.z,
@@ -1203,9 +2026,17 @@ export default function App() {
             finished: player.finished,
             finishTimeMs: player.finishTimeMs,
           };
+
+          broadcastChannelRef.current?.postMessage({
+            type: 'player:moved',
+            roomId: activeRoomRef.current.roomId,
+            player: payload,
+          });
+
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify(payload));
-          } else if (now - lastHttpFallbackSyncTime > 250) {
+          }
+          if (now - lastHttpFallbackSyncTime > 300) {
             lastHttpFallbackSyncTime = now;
             fetch(`/api/lobbies/${activeRoomRef.current.roomId}/sync`, {
               method: 'POST',
@@ -1229,32 +2060,48 @@ export default function App() {
           }
         }
 
-        // Update 3D Car Meshes, Steering Wheel & Hands
+        // Update 3D Formula Car Meshes, Exposed Wheels, Steering Wheel & Driver Hands
         for (let i = 0; i < cars.length; i++) {
           const c = cars[i];
           const rig = carRigs[i];
           if (!rig) continue;
           rig.root.position.set(c.x, c.y, c.z);
           rig.root.rotation.y = c.heading;
-          rig.bodyTiltGroup.rotation.x = -c.chassisPitch;
+          const slopePitch = c.trackSlopePitch ?? 0;
+          rig.bodyTiltGroup.rotation.x = slopePitch - c.chassisPitch;
           rig.bodyTiltGroup.rotation.z = c.chassisRoll;
           rig.frontLeftSteer.rotation.y = c.steerAngle;
           rig.frontRightSteer.rotation.y = c.steerAngle;
-          // Rotate the 3D Cockpit Steering Wheel & Driver Hands in real-time!
-          rig.steeringWheelRig.rotation.z = -c.steerAngle * 2.65;
+          rig.steeringWheelRig.rotation.z = -c.steerAngle * 2.45;
           rig.headlightBeamGroup.visible = showHeadlights;
 
           for (const w of rig.wheelMeshes) {
             w.rotation.x = c.wheelRotation;
           }
-          const isBraking = i === 0 ? brake > 0.1 || handbrake : false;
+          if (rig.drsFlapMesh) {
+            rig.drsFlapMesh.rotation.x = c.nitroActive ? -0.38 : 0.08;
+          }
+          const isBraking =
+            i === 0
+              ? brake > 0.1 || handbrake
+              : c.inPitBox || (c.aiPitStopTimer ?? 0) > 0;
           rig.brakeLightMat.color.setHex(isBraking ? 0xff4444 : 0x991b1b);
           rig.nitroFlameLeft.visible = c.nitroActive;
           rig.nitroFlameRight.visible = c.nitroActive;
         }
 
+        const anyCarInPit =
+          player.inPitBox ||
+          player.inPitLaneAlley ||
+          cars.some((c) => c.inPitBox || (c.aiPitStopTimer ?? 0) > 0);
+        updatePitCrewAnimation(currentTrackGroup, anyCarInPit, now * 0.001);
+
         // Tire smoke / rain spray particles
-        if (player.isDrifting || handbrake || (weatherRef.current === 'rain' && player.speedKmh > 90)) {
+        if (
+          player.isDrifting ||
+          handbrake ||
+          (weatherRef.current === 'rain' && player.speedKmh > 90)
+        ) {
           const sinH = Math.sin(player.heading);
           const cosH = Math.cos(player.heading);
           particles.spawn(
@@ -1279,6 +2126,7 @@ export default function App() {
           player.slipAngle,
           player.nitroActive,
           true,
+          player.gear,
           player.surface === 'kerb' && player.speedKmh > 25
         );
 
@@ -1309,43 +2157,43 @@ export default function App() {
             : 0;
 
         if (camMode === 'chase') {
-          const dist = 7.1 + smoothSpeedBackOffset;
+          const dist = 6.8 + smoothSpeedBackOffset;
           camera.position.set(
             player.x - sinCam * dist + rightX * smoothLateralCamOffset,
-            player.y + 2.65 + Math.abs(impactShake),
+            player.y + 2.45 + Math.abs(impactShake),
             player.z - cosCam * dist + rightZ * smoothLateralCamOffset
           );
           camera.lookAt(
             player.x + Math.sin(player.heading) * 6.5,
-            player.y + 0.85,
+            player.y + 0.78,
             player.z + Math.cos(player.heading) * 6.5
           );
         } else if (camMode === 'close') {
-          const dist = 5.0 + smoothSpeedBackOffset * 0.6;
+          const dist = 4.8 + smoothSpeedBackOffset * 0.6;
           camera.position.set(
             player.x - sinCam * dist + rightX * (smoothLateralCamOffset * 0.7),
-            player.y + 1.85 + Math.abs(impactShake),
+            player.y + 1.68 + Math.abs(impactShake),
             player.z - cosCam * dist + rightZ * (smoothLateralCamOffset * 0.7)
           );
           camera.lookAt(
             player.x + Math.sin(player.heading) * 9.0,
-            player.y + 0.8,
+            player.y + 0.72,
             player.z + Math.cos(player.heading) * 9.0
           );
         } else if (camMode === 'hood') {
-          // Cockpit Interior View: Driver's eye position inside the cabin looking over the 3D steering wheel & hands
+          // First-Person Open-Cockpit Formula View
           const sinH = Math.sin(player.heading);
           const cosH = Math.cos(player.heading);
-          const headSwayX = -player.steerAngle * 0.14;
+          const headSwayX = -player.steerAngle * 0.12;
           camera.position.set(
-            player.x - sinH * 0.08 + cosH * headSwayX,
-            player.y + 0.89 + Math.abs(impactShake) * 0.35,
-            player.z - cosH * 0.08 - sinH * headSwayX
+            player.x - sinH * 0.14 + cosH * headSwayX,
+            player.y + 0.94 + Math.abs(impactShake) * 0.3,
+            player.z - cosH * 0.14 - sinH * headSwayX
           );
           camera.lookAt(
-            player.x + sinH * 14.0,
-            player.y + 0.74 - player.chassisPitch * 3.0,
-            player.z + cosH * 14.0
+            player.x + sinH * 16.0,
+            player.y + 0.79 - player.chassisPitch * 2.8,
+            player.z + cosH * 16.0
           );
         } else {
           camera.position.set(
@@ -1368,7 +2216,7 @@ export default function App() {
           weatherRef.current
         );
 
-        // Throttled HUD DOM updates (20Hz instead of every frame -> eliminates SVG/CSS layout thrashing)
+        // Throttled HUD DOM updates (20Hz)
         if (now - lastHudDomSyncTime >= 50) {
           lastHudDomSyncTime = now;
 
@@ -1382,12 +2230,12 @@ export default function App() {
               player.gear === -1 ? 'R' : player.gear.toString();
           }
           if (rpmTextRef.current) {
-            rpmTextRef.current.textContent = `${Math.round(player.rpm)} RPM`;
+            rpmTextRef.current.textContent = `${Math.round(player.rpm)}`;
           }
           if (rpmBarRef.current) {
             const rpmArc = Math.min(
               175,
-              Math.max(12, ((player.rpm - 800) / 7300) * 175)
+              Math.max(12, ((player.rpm - 1000) / 7000) * 175)
             );
             rpmBarRef.current.setAttribute(
               'stroke-dasharray',
@@ -1402,20 +2250,134 @@ export default function App() {
                 : '#f59e0b'
             );
           }
+
+          // Update 15-LED Shift Light Strip
+          const activeLeds = Math.round(
+            Math.max(0, Math.min(1, (player.rpm - 2200) / 5600)) * 15
+          );
+          for (let lIdx = 0; lIdx < 15; lIdx++) {
+            const ledEl = shiftLedStripRefs.current[lIdx]?.current;
+            if (!ledEl) continue;
+            if (lIdx < activeLeds) {
+              ledEl.style.backgroundColor =
+                lIdx < 5
+                  ? '#22c55e'
+                  : lIdx < 10
+                  ? '#ef4444'
+                  : '#38bdf8';
+            } else {
+              ledEl.style.backgroundColor = '#1e293b';
+            }
+          }
+
           if (nitroBarRef.current) {
             nitroBarRef.current.style.width = `${Math.round(
               player.nitroAmount
             )}%`;
           }
+
+          // Update Live 4-Wheel Tire Wear & Temperature HUD
+          const tireH = Math.round(player.tireHealth);
+          const tireColor =
+            tireH > 68 ? '#22c55e' : tireH > 35 ? '#f59e0b' : '#ef4444';
+          if (tirePctTextRef.current) {
+            tirePctTextRef.current.textContent = `${tireH}%`;
+            tirePctTextRef.current.style.color = tireColor;
+          }
+          if (tireTempTextRef.current) {
+            tireTempTextRef.current.textContent = `${Math.round(
+              player.tireTemp
+            )}°C`;
+          }
+          if (tireBarFillRef.current) {
+            tireBarFillRef.current.style.width = `${tireH}%`;
+            tireBarFillRef.current.style.backgroundColor = tireColor;
+          }
+          for (let wIdx = 0; wIdx < 4; wIdx++) {
+            const boxEl = tireWheelBoxRefs.current[wIdx]?.current;
+            if (boxEl) {
+              const wh = player.tireWear[wIdx];
+              boxEl.style.backgroundColor =
+                wh > 68 ? '#22c55e' : wh > 35 ? '#f59e0b' : '#ef4444';
+            }
+          }
+
+          // Update Pit Zone Button & Top-Center Pit Status Banner
+          if (pitZoneBannerRef.current) {
+            if (player.inPitLaneAlley || player.inPitBox) {
+              pitZoneBannerRef.current.className =
+                'px-2.5 py-1 bg-emerald-500 text-slate-950 border border-emerald-200 text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
+            } else if (pitRequestedRef.current || player.tireHealth < 55) {
+              pitZoneBannerRef.current.className =
+                'px-2.5 py-1 bg-[#e10600] text-white border border-rose-300 text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
+            } else {
+              pitZoneBannerRef.current.className =
+                'px-2.5 py-1 bg-black/90 hover:bg-zinc-900 border border-white/20 text-white text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl cursor-pointer';
+            }
+          }
+
+          if (pitStatusBannerRef.current && pitStatusTextRef.current) {
+            if (player.inPitLaneAlley && player.pitExitCooldown <= 0) {
+              pitStatusBannerRef.current.style.display = 'flex';
+              pitStatusBannerRef.current.style.borderColor = '#22c55e';
+              pitStatusTextRef.current.textContent =
+                '🟢 V ULIČCE V BOXECH (OMEZOVAČ 80 KM/H) — DOJED K MECHANIKŮM V BOXU NEBO STISKNI [B]';
+              pitStatusTextRef.current.style.color = '#86efac';
+            } else if (player.inPitZone && player.pitExitCooldown <= 0) {
+              pitStatusBannerRef.current.style.display = 'flex';
+              pitStatusBannerRef.current.style.borderColor = '#22c55e';
+              pitStatusTextRef.current.textContent =
+                '🟢 VJEZD DO BOXŮ VPRAVO (PIT IN) — ZATOČ VPRAVO ZA PIT WALL K 3D MECHANIKŮM!';
+              pitStatusTextRef.current.style.color = '#86efac';
+            } else if (pitRequestedRef.current) {
+              pitStatusBannerRef.current.style.display = 'flex';
+              pitStatusBannerRef.current.style.borderColor = '#f59e0b';
+              pitStatusTextRef.current.textContent = `📻 BOX V TOMTO KOLE POTVRZEN — ZAJED VPRAVO DO ULIČKY PIT IN ZA ${Math.round(
+                player.distanceToPitMeters
+              )} m`;
+              pitStatusTextRef.current.style.color = '#fde68a';
+            } else if (player.tireHealth < 45) {
+              pitStatusBannerRef.current.style.display = 'flex';
+              pitStatusBannerRef.current.style.borderColor = '#ef4444';
+              pitStatusTextRef.current.textContent = `⚠️ OPOTŘEBENÉ PNEU (${tireH}%) — ZAJED VPRAVO DO ULIČKY PIT IN NA CÍLOVÉ ROVINCE`;
+              pitStatusTextRef.current.style.color = '#fca5a5';
+            } else {
+              pitStatusBannerRef.current.style.display = 'none';
+            }
+          }
+
           if (lapTimeTextRef.current) {
             lapTimeTextRef.current.textContent = formatRaceTime(
               player.currentLapTimeMs
             );
           }
           if (bestLapTextRef.current) {
-            bestLapTextRef.current.textContent = formatRaceTime(
-              player.bestLapTimeMs
-            );
+            if (player.bestLapTimeMs) {
+              const expectedAtProgress =
+                player.bestLapTimeMs * Math.max(0.02, player.trackProgressT);
+              const deltaSec =
+                (player.currentLapTimeMs - expectedAtProgress) / 1000;
+              const clampedDelta = Math.max(-9.999, Math.min(9.999, deltaSec));
+              const sign = clampedDelta <= 0 ? '-' : '+';
+              bestLapTextRef.current.textContent = `${sign}${Math.abs(
+                clampedDelta
+              )
+                .toFixed(3)
+                .replace('.', ',')}`;
+            } else {
+              const targetLapMs = 42000;
+              const expectedAtProgress =
+                targetLapMs * Math.max(0.02, player.trackProgressT);
+              const deltaSec =
+                (player.currentLapTimeMs - expectedAtProgress) / 1000;
+              const clampedDelta = Math.max(-9.999, Math.min(9.999, deltaSec));
+              const sign = clampedDelta <= 0 ? '-' : '+';
+              bestLapTextRef.current.textContent = `${sign}${Math.abs(
+                clampedDelta
+              )
+                .toFixed(3)
+                .replace('.', ',')}`;
+            }
           }
           if (driftTotalTextRef.current) {
             driftTotalTextRef.current.textContent = Math.round(
@@ -1429,27 +2391,27 @@ export default function App() {
                 : '';
           }
           if (frontLoadTextRef.current) {
-            frontLoadTextRef.current.textContent = `P:${Math.round(
+            frontLoadTextRef.current.textContent = `${Math.round(
               player.frontAxleLoadRatio * 100
-            )}%`;
+            )} %`;
           }
           if (surfaceBadgeRef.current) {
             if (player.isDrifting) {
               surfaceBadgeRef.current.textContent = 'SMYK!';
               surfaceBadgeRef.current.className =
-                'text-[10px] font-bold uppercase tracking-wider text-amber-400';
+                'text-[8px] font-bold uppercase tracking-wider text-amber-400';
             } else if (player.surface === 'grass') {
-              surfaceBadgeRef.current.textContent = 'MIMO TRAŤ';
+              surfaceBadgeRef.current.textContent = 'TRÁVA';
               surfaceBadgeRef.current.className =
-                'text-[10px] font-bold uppercase tracking-wider text-rose-400';
+                'text-[8px] font-bold uppercase tracking-wider text-rose-400';
             } else if (player.surface === 'kerb') {
               surfaceBadgeRef.current.textContent = 'OBRUBNÍK';
               surfaceBadgeRef.current.className =
-                'text-[10px] font-bold uppercase tracking-wider text-cyan-400';
+                'text-[8px] font-bold uppercase tracking-wider text-cyan-400';
             } else {
               surfaceBadgeRef.current.textContent = 'ASFALT';
               surfaceBadgeRef.current.className =
-                'text-[10px] font-bold uppercase tracking-wider text-emerald-400';
+                'text-[8px] font-bold uppercase tracking-wider text-emerald-400';
             }
           }
           if (gDotRef.current) {
@@ -1466,9 +2428,16 @@ export default function App() {
             playerMapDotRef.current.setAttribute('cy', pMap.mz.toFixed(1));
           }
           if (playerMapLabelRef.current) {
-            playerMapLabelRef.current.setAttribute('x', (pMap.mx + 5.5).toFixed(1));
-            playerMapLabelRef.current.setAttribute('y', (pMap.mz + 2.2).toFixed(1));
-            playerMapLabelRef.current.textContent = playerNameRef.current.slice(0, 10);
+            playerMapLabelRef.current.setAttribute(
+              'x',
+              (pMap.mx + 5.5).toFixed(1)
+            );
+            playerMapLabelRef.current.setAttribute(
+              'y',
+              (pMap.mz + 2.2).toFixed(1)
+            );
+            playerMapLabelRef.current.textContent =
+              playerNameRef.current.slice(0, 10);
           }
 
           for (let i = 0; i < rivalDotRefs.current.length; i++) {
@@ -1522,6 +2491,14 @@ export default function App() {
               colorHex: c.spec.colorHex,
               speedKmh: c.speedKmh,
               lap: c.lap,
+              tireCompound: c.tireCompound,
+              tireHealth: c.tireHealth,
+              inPitBox: c.inPitBox,
+              inPitLaneAlley: c.inPitLaneAlley,
+              pitStopsCompleted: c.pitStopsCompleted,
+              aiStrategyName: c.aiStrategyName,
+              finished: c.finished,
+              finishTimeMs: c.finishTimeMs,
             }))
           );
 
@@ -1530,10 +2507,11 @@ export default function App() {
             setSummary({
               position: currentPos,
               totalCars: cars.length,
-              totalTimeMs: player.finishTimeMs ?? player.currentLapTimeMs,
+              totalTimeMs: player.finishTimeMs ?? player.totalRaceTimeMs,
               bestLapMs: player.bestLapTimeMs,
               maxSpeedKmh: maxPlayerSpeedKmh,
               driftScore: player.driftScore,
+              pitStopsCompleted: player.pitStopsCompleted,
               carName: player.spec.name,
               trackName: trackDef.name,
               standings: standings.map((c) => ({
@@ -1541,14 +2519,61 @@ export default function App() {
                 isPlayer: c.isPlayer,
                 speedKmh: c.speedKmh,
                 lap: c.lap,
+                tireCompound: c.tireCompound,
+                pitStopsCompleted: c.pitStopsCompleted,
+                aiStrategyName: c.aiStrategyName,
+                finished: c.finished,
+                finishTimeMs: c.finishTimeMs,
               })),
             });
+            if (authUserRef.current) {
+              recordRaceResultInHallOfFame(authUserRef.current, {
+                position: currentPos,
+                trackId: trackDef.id,
+                trackName: trackDef.name,
+                bestLapTimeMs: player.bestLapTimeMs,
+                carName: player.spec.name,
+                tireCompound: player.tireCompound,
+              }).catch(() => {});
+            }
             audio.playLapComplete(currentPos === 1);
             updatePhase('gameover');
           }
         }
+      } else if (currentPhase === 'pitstop') {
+        // Live 3D Pit Stop Broadcast Camera watching the 6 F1 Pit Crew mechanics service the car in the left-center viewport
+        updatePitCrewAnimation(currentTrackGroup, true, now * 0.001);
+        const sinH = Math.sin(player.heading);
+        const cosH = Math.cos(player.heading);
+        const rightX = cosH;
+        const rightZ = -sinH;
+        const orbit = Math.sin(now * 0.0015) * 0.45;
+        // Lift the car slightly on the front/rear jacks while in the pit stop
+        if (carRigs[0]) {
+          carRigs[0].root.position.set(
+            player.x,
+            player.y + 0.14 + Math.sin(now * 0.018) * 0.012,
+            player.z
+          );
+          carRigs[0].exteriorBodyMesh.visible = true;
+          carRigs[0].cockpitGroup.visible = false;
+        }
+        camera.position.set(
+          player.x + sinH * (4.2 + orbit * 0.25) - rightX * (3.6 + orbit * 0.15),
+          player.y + 2.05,
+          player.z + cosH * (4.2 + orbit * 0.25) - rightZ * (3.6 + orbit * 0.15)
+        );
+        // Aim slightly to the right of the car so the car + 6 Pit Crew mechanics appear in the left-center of the screen
+        camera.lookAt(
+          player.x + rightX * 1.35,
+          player.y + 0.35,
+          player.z + rightZ * 1.35
+        );
+        audio.updateEngine(1850, 0.15, false, 0, false, false, 1, false);
       } else {
-        audio.updateEngine(1000, 0, false, 0, false, false, false);
+        // Paused or Game Over
+        updatePitCrewAnimation(currentTrackGroup, false, now * 0.001);
+        audio.updateEngine(1000, 0, false, 0, false, false, 1, false);
       }
 
       renderer.render(scene, camera);
@@ -1590,6 +2615,8 @@ export default function App() {
         onGenerateRandomTrack={handleGenerateRandomTrack}
         selectedCarIdx={selectedCarIdx}
         onSelectCar={handleSelectCar}
+        selectedCompound={selectedCompound}
+        onSelectCompound={handleSelectCompound}
         botCount={botCount}
         onChangeBotCount={handleChangeBotCount}
         botDifficulty={botDifficulty}
@@ -1599,10 +2626,7 @@ export default function App() {
         weather={weather}
         onChangeWeather={handleChangeWeather}
         totalLaps={totalLaps}
-        onChangeTotalLaps={(laps) => {
-          totalLapsRef.current = laps;
-          setTotalLaps(laps);
-        }}
+        onChangeTotalLaps={handleChangeTotalLaps}
         tuning={tuning}
         onChangeTuning={handleChangeTuning}
         cameraMode={cameraMode}
@@ -1621,6 +2645,13 @@ export default function App() {
         onRestartRace={handleRestartRace}
         onReturnTitle={handleReturnTitle}
         onFinishEarly={() => finishEarlyCallbackRef.current?.()}
+        onEnterPitStop={handleEnterPitStop}
+        onForceOpenPitStop={handleForceOpenPitStop}
+        onCompletePitStop={handleCompletePitStop}
+        onFastenWheelSound={(quality) =>
+          audioRef.current?.playWheelGunSound(quality)
+        }
+        onJackReleaseSound={() => audioRef.current?.playJackReleaseSound()}
         onTouchControl={handleTouchControl}
         liveRefs={liveRefs}
         playerName={playerName}
@@ -1631,8 +2662,15 @@ export default function App() {
         lobbyError={lobbyError}
         onCreateLobby={handleCreateLobby}
         onJoinLobby={handleJoinLobby}
+        onQuickMatchLobby={handleQuickMatchLobby}
         onLeaveLobby={handleLeaveLobby}
         onRefreshLobbies={handleRefreshLobbies}
+        onSendLobbyChat={handleSendLobbyChat}
+        authUser={authUser}
+        onSignInGoogle={handleSignInGoogle}
+        onSignOutGoogle={handleSignOutGoogle}
+        hallOfFameDrivers={hallOfFameDrivers}
+        hallOfFameLaps={hallOfFameLaps}
       />
     </main>
   );
