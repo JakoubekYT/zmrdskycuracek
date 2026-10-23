@@ -21,11 +21,11 @@ import {
   updateDoc,
   where,
 } from 'firebase/firestore';
-import firebaseConfig from '../firebase-applet-config.json';
+import { resolvedFirebaseConfig } from './config/firebaseConfig';
 import { TireCompound } from './game/physics';
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const app = initializeApp(resolvedFirebaseConfig);
+export const db = getFirestore(app, resolvedFirebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
@@ -128,12 +128,50 @@ function sanitizeId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60) || 'default';
 }
 
-export async function signInWithGooglePopup(): Promise<User | null> {
-  const result = await signInWithPopup(auth, googleProvider);
-  if (result.user) {
-    await ensureDriverProfileExists(result.user);
+export interface GoogleAuthResult {
+  user: User | null;
+  error?: string;
+  unauthorizedDomain?: boolean;
+  domainName?: string;
+}
+
+export async function signInWithGooglePopup(): Promise<GoogleAuthResult> {
+  try {
+    const result = await signInWithPopup(auth, googleProvider);
+    if (result.user) {
+      await ensureDriverProfileExists(result.user);
+    }
+    return { user: result.user };
+  } catch (error: any) {
+    const code = String(error?.code || '');
+    const msg = String(error?.message || '');
+    const currentDomain =
+      typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+
+    if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+      console.warn(
+        `[Firebase Auth] Doména '${currentDomain}' není v seznamu Authorized Domains Firebase projektu.`
+      );
+      return {
+        user: null,
+        error: `Doména "${currentDomain}" zatím není autorizována v Google Firebase Console. V aplikaci můžeš okamžitě závodit a hrát online multiplayer jako Hostující pilot!`,
+        unauthorizedDomain: true,
+        domainName: currentDomain,
+      };
+    }
+
+    if (code === 'auth/popup-blocked') {
+      return {
+        user: null,
+        error: 'Vyskakovací okno Google přihlášení bylo zablokováno prohlížečem.',
+      };
+    }
+
+    return {
+      user: null,
+      error: error instanceof Error ? error.message : 'Chyba přihlášení',
+    };
   }
-  return result.user;
 }
 
 export async function signOutGoogleUser(): Promise<void> {
@@ -145,7 +183,8 @@ export function subscribeAuthUser(cb: (user: User | null) => void): () => void {
 }
 
 export async function ensureDriverProfileExists(user: User): Promise<void> {
-  if (!user.emailVerified) return;
+  const isGoogle = user.providerData?.some((p) => p.providerId === 'google.com');
+  if (!user.emailVerified && !isGoogle) return;
   const uid = sanitizeId(user.uid);
   const path = `hall_of_fame_drivers/${uid}`;
   const ref = doc(db, 'hall_of_fame_drivers', uid);
@@ -529,3 +568,289 @@ export function subscribeHallOfFameData(
     unsubLaps();
   };
 }
+
+// ============================================================================
+// REAL-TIME FIRESTORE MULTIPLAYER CLOUD LOBBIES (CROSS-DEVICE / VERCEL COMPATIBLE)
+// ============================================================================
+
+export interface CloudPlayerDTO {
+  id: string;
+  name: string;
+  carSpecId: string;
+  colorHex: number;
+  tireCompound?: TireCompound;
+  isReady: boolean;
+  isHost: boolean;
+  x: number;
+  y: number;
+  z: number;
+  heading: number;
+  speedKmh: number;
+  steerAngle: number;
+  chassisPitch: number;
+  chassisRoll: number;
+  isDrifting: boolean;
+  nitroActive: boolean;
+  lap: number;
+  totalDistanceDriven: number;
+  finished: boolean;
+  finishTimeMs: number | null;
+}
+
+export interface CloudChatMessageDTO {
+  id: string;
+  senderName: string;
+  senderColorHex: number;
+  text: string;
+  timestamp: number;
+}
+
+export interface CloudLobbyDTO {
+  roomId: string;
+  hostId: string;
+  trackId: string;
+  totalLaps: number;
+  botCount: number;
+  botDifficulty: 'easy' | 'medium' | 'hard';
+  status: 'waiting' | 'racing' | 'finished';
+  raceStartedAt: number | null;
+  players: CloudPlayerDTO[];
+  chatMessages?: CloudChatMessageDTO[];
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface CloudLobbySummary {
+  roomId: string;
+  trackId: string;
+  totalLaps: number;
+  botCount: number;
+  status: string;
+  playerCount: number;
+  hostName: string;
+}
+
+export async function createCloudLobby(room: CloudLobbyDTO): Promise<string> {
+  const roomId = sanitizeId(room.roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', roomId);
+  const now = Date.now();
+  await setDoc(ref, {
+    roomId,
+    hostId: room.hostId,
+    trackId: room.trackId,
+    totalLaps: room.totalLaps,
+    botCount: room.botCount,
+    botDifficulty: room.botDifficulty,
+    status: room.status,
+    raceStartedAt: room.raceStartedAt,
+    players: room.players,
+    chatMessages: (room.chatMessages || []).slice(-25),
+    createdAt: now,
+    updatedAt: now,
+  });
+  return roomId;
+}
+
+export async function joinCloudLobby(
+  roomId: string,
+  player: CloudPlayerDTO
+): Promise<CloudLobbyDTO | null> {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) {
+    return null;
+  }
+  const data = snap.data();
+  const existingPlayers: CloudPlayerDTO[] = Array.isArray(data.players)
+    ? data.players
+    : [];
+  const filtered = existingPlayers.filter((p) => p.id !== player.id);
+  filtered.push(player);
+
+  const updatedChat: CloudChatMessageDTO[] = Array.isArray(data.chatMessages)
+    ? data.chatMessages
+    : [];
+  updatedChat.push({
+    id: `join-${Date.now()}`,
+    senderName: 'FIA Box',
+    senderColorHex: 0x22c55e,
+    text: `Pilot ${player.name} se připojil na startovní rošt!`,
+    timestamp: Date.now(),
+  });
+
+  const now = Date.now();
+  await updateDoc(ref, {
+    players: filtered,
+    chatMessages: updatedChat.slice(-25),
+    updatedAt: now,
+  });
+
+  return {
+    roomId: cleanId,
+    hostId: String(data.hostId || player.id),
+    trackId: String(data.trackId || 'alpine-gp'),
+    totalLaps: Number(data.totalLaps || 3),
+    botCount: Number(data.botCount ?? 4),
+    botDifficulty: data.botDifficulty || 'medium',
+    status: data.status || 'waiting',
+    raceStartedAt: data.raceStartedAt || null,
+    players: filtered,
+    chatMessages: updatedChat.slice(-25),
+    updatedAt: now,
+  };
+}
+
+export async function leaveCloudLobby(
+  roomId: string,
+  playerId: string
+): Promise<void> {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  const existing: CloudPlayerDTO[] = Array.isArray(data.players)
+    ? data.players
+    : [];
+  const remaining = existing.filter((p) => p.id !== playerId);
+  let newHostId = data.hostId;
+  if (data.hostId === playerId && remaining.length > 0) {
+    newHostId = remaining[0].id;
+    remaining[0].isHost = true;
+  }
+  await updateDoc(ref, {
+    players: remaining,
+    hostId: newHostId,
+    updatedAt: Date.now(),
+  });
+}
+
+export async function updateCloudRoom(
+  roomId: string,
+  patch: Partial<CloudLobbyDTO>
+): Promise<void> {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  await updateDoc(ref, {
+    ...patch,
+    updatedAt: Date.now(),
+  });
+}
+
+export async function updateCloudPlayerTelemetry(
+  roomId: string,
+  player: CloudPlayerDTO
+): Promise<void> {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  const list: CloudPlayerDTO[] = Array.isArray(data.players) ? data.players : [];
+  const idx = list.findIndex((p) => p.id === player.id);
+  if (idx >= 0) {
+    list[idx] = { ...list[idx], ...player };
+  } else {
+    list.push(player);
+  }
+  await updateDoc(ref, {
+    players: list,
+    updatedAt: Date.now(),
+  });
+}
+
+export async function sendCloudLobbyChat(
+  roomId: string,
+  message: CloudChatMessageDTO
+): Promise<void> {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return;
+  const data = snap.data();
+  const msgs: CloudChatMessageDTO[] = Array.isArray(data.chatMessages)
+    ? data.chatMessages
+    : [];
+  msgs.push(message);
+  await updateDoc(ref, {
+    chatMessages: msgs.slice(-25),
+    updatedAt: Date.now(),
+  });
+}
+
+export function subscribeCloudRoom(
+  roomId: string,
+  onUpdate: (room: CloudLobbyDTO | null) => void
+): () => void {
+  const cleanId = sanitizeId(roomId.toUpperCase());
+  const ref = doc(db, 'multiplayer_lobbies', cleanId);
+  return onSnapshot(
+    ref,
+    (snap) => {
+      if (!snap.exists()) {
+        onUpdate(null);
+        return;
+      }
+      const data = snap.data();
+      const room: CloudLobbyDTO = {
+        roomId: cleanId,
+        hostId: String(data.hostId || ''),
+        trackId: String(data.trackId || 'alpine-gp'),
+        totalLaps: Number(data.totalLaps || 3),
+        botCount: Number(data.botCount ?? 4),
+        botDifficulty: data.botDifficulty || 'medium',
+        status: data.status || 'waiting',
+        raceStartedAt: data.raceStartedAt || null,
+        players: Array.isArray(data.players) ? data.players : [],
+        chatMessages: Array.isArray(data.chatMessages) ? data.chatMessages : [],
+        updatedAt: Number(data.updatedAt || 0),
+      };
+      onUpdate(room);
+    },
+    (err) => {
+      console.warn('[Firestore] Error subscribing to cloud room:', err);
+    }
+  );
+}
+
+export function subscribeCloudLobbies(
+  onUpdate: (summaries: CloudLobbySummary[]) => void
+): () => void {
+  const colRef = collection(db, 'multiplayer_lobbies');
+  return onSnapshot(
+    colRef,
+    (snapshot) => {
+      const list: CloudLobbySummary[] = [];
+      const now = Date.now();
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        const updated = Number(d.updatedAt || d.createdAt || 0);
+        // Display rooms active within the last 24 hours
+        if (now - updated < 86400000) {
+          const players: CloudPlayerDTO[] = Array.isArray(d.players)
+            ? d.players
+            : [];
+          const hostPlayer = players.find((p) => p.id === d.hostId);
+          list.push({
+            roomId: docSnap.id,
+            trackId: String(d.trackId || 'alpine-gp'),
+            totalLaps: Number(d.totalLaps || 3),
+            botCount: Number(d.botCount ?? 4),
+            status: String(d.status || 'waiting'),
+            playerCount: players.length,
+            hostName: hostPlayer?.name || 'F1 Host',
+          });
+        }
+      });
+      list.sort(
+        (a, b) => (b.status === 'waiting' ? 1 : 0) - (a.status === 'waiting' ? 1 : 0)
+      );
+      onUpdate(list);
+    },
+    (err) => {
+      console.warn('[Firestore] Error listing cloud lobbies:', err);
+    }
+  );
+}
+

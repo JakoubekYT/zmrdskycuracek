@@ -98,7 +98,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [roomId, room] of rooms.entries()) {
     for (const [pid, p] of room.players.entries()) {
-      if (pid.startsWith('online-') || now - p.lastSeen > 45000) {
+      if (now - p.lastSeen > 45000) {
         room.players.delete(pid);
       }
     }

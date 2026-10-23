@@ -4,5 +4,15 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+
+# Sensitive environment files with actual secrets
+.env
+.env.local
+.env.*.local
+*.local
+
+# Firebase credentials with live project keys
+firebase-applet-config.json
+
+# Keep template example files
 !.env.example

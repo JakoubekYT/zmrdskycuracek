@@ -126,11 +126,11 @@ export const TRACK_DEFINITIONS: TrackDefinition[] = [
       [96, -1.5, 12],
       [152, 2.8, -36],
       [202, 5.2, -98],
-      [154, 2.4, -162],
-      [78, 0.0, -150],
-      [42, 0.0, -98],
-      [6, 0, -118],
-      [0, 0, -64],
+      [162, 2.4, -164],
+      [96, 0.0, -158],
+      [48, 0.0, -126],
+      [16, 0.0, -78],
+      [0, 0, -32],
     ],
   },
   {
@@ -312,60 +312,59 @@ export function buildProceduralTrackDefinition(seed: number): TrackDefinition {
   const gripFactor = Number((0.94 + rand() * 0.1).toFixed(2));
   const roadHalfWidth = Number((9.2 + rand() * 0.8).toFixed(1));
 
-  const numPts = 16;
-  const rawRadii: number[] = [];
+  const numPts = 18;
   const phase2 = rand() * Math.PI * 2;
   const phase3 = rand() * Math.PI * 2;
   const elevPhase = rand() * Math.PI * 2;
-  const amp2 = 16 + rand() * 16;
-  const amp3 = 10 + rand() * 14;
+  const amp2 = 0.08 + rand() * 0.06;
+  const amp3 = 0.05 + rand() * 0.05;
 
-  for (let i = 0; i < numPts; i++) {
-    const theta = (i / numPts) * Math.PI * 2;
-    const jitter = (rand() - 0.5) * 18;
-    const r =
-      142 +
-      Math.cos(theta * 2 + phase2) * amp2 +
-      Math.sin(theta * 3 + phase3) * amp3 +
-      jitter;
-    rawRadii.push(Math.max(102, Math.min(182, r)));
-  }
+  const cx = 115 + rand() * 25;
+  const cz = 0;
+  const rx = 92 + rand() * 20;
+  const rz = 135 + rand() * 25;
 
-  const smoothRadii = [...rawRadii];
-  for (let pass = 0; pass < 2; pass++) {
-    const copy = [...smoothRadii];
-    for (let i = 0; i < numPts; i++) {
-      const prev = copy[(i - 1 + numPts) % numPts];
-      const curr = copy[i];
-      const next = copy[(i + 1) % numPts];
-      smoothRadii[i] = prev * 0.25 + curr * 0.5 + next * 0.25;
-    }
-  }
-
-  const r0 = smoothRadii[0];
-  const centerX = r0;
-  const centerZ = 10;
-
-  const waypoints: Array<[number, number, number]> = [
+  // Build smooth parametric perimeter points
+  const rawWaypoints: Array<[number, number, number]> = [
     [0, 0, 0],
-    [0, 0, 76],
+    [0, 0, 78],
+    [32, 2.5, 142],
   ];
 
-  for (let i = 2; i < numPts - 1; i++) {
-    const frac = (i - 1) / (numPts - 2);
-    const angle = Math.PI * 0.78 - frac * Math.PI * 1.56;
-    const r = smoothRadii[i];
-    const wx = Math.round(centerX + Math.cos(angle) * r);
-    const wz = Math.round(centerZ + Math.sin(angle) * r);
-    // Smooth 3D elevation on back sectors while keeping pit straight flat at y=0
+  // Back-sector harmonic loop (angles from +75 deg to -75 deg)
+  const backSteps = numPts - 5;
+  for (let s = 0; s < backSteps; s++) {
+    const frac = (s + 1) / (backSteps + 1);
+    const theta = Math.PI * 0.44 - frac * Math.PI * 1.88;
+    const rMod = 1.0 + Math.cos(theta * 2 + phase2) * amp2 + Math.sin(theta * 3 + phase3) * amp3;
+    const wx = Math.round(cx + Math.cos(theta) * rx * rMod);
+    const wz = Math.round(cz + Math.sin(theta) * rz * rMod);
+
+    // Natural 3D elevation roller-coaster with flat pit straight
     const elevEnvelope = Math.sin(frac * Math.PI);
     const wy = Number(
-      (Math.sin(frac * Math.PI * 2.5 + elevPhase) * 5.5 * elevEnvelope).toFixed(1)
+      (Math.sin(frac * Math.PI * 2.2 + elevPhase) * 6.0 * elevEnvelope).toFixed(1)
     );
-    waypoints.push([Math.max(38, wx), wy, wz]);
+    rawWaypoints.push([Math.max(26, wx), wy, wz]);
   }
 
-  waypoints.push([0, 0, -70]);
+  rawWaypoints.push([28, 0.0, -138]);
+  rawWaypoints.push([0, 0, -76]);
+
+  // Smooth waypoints with 2-pass weighted filter (keeping main straight locked)
+  const waypoints = rawWaypoints.map(([x, y, z]) => [x, y, z] as [number, number, number]);
+  for (let pass = 0; pass < 2; pass++) {
+    const copy = waypoints.map(([x, y, z]) => [x, y, z] as [number, number, number]);
+    const n = copy.length;
+    for (let i = 2; i < n - 1; i++) {
+      const prev = copy[(i - 1 + n) % n];
+      const curr = copy[i];
+      const next = copy[(i + 1) % n];
+      waypoints[i][0] = Math.round(prev[0] * 0.22 + curr[0] * 0.56 + next[0] * 0.22);
+      waypoints[i][1] = Number((prev[1] * 0.25 + curr[1] * 0.5 + next[1] * 0.25).toFixed(1));
+      waypoints[i][2] = Math.round(prev[2] * 0.22 + curr[2] * 0.56 + next[2] * 0.22);
+    }
+  }
 
   return {
     id: `proc-${cleanSeed}`,
@@ -684,10 +683,16 @@ export function findClosestTrackSample(
   let surface: SurfaceType = 'asphalt';
   if (inPitAlleyLateral) {
     surface = 'asphalt';
-  } else if (absOffset > roadHalfWidth + TRACK_KERB_WIDTH) {
-    surface = 'grass';
-  } else if (absOffset > roadHalfWidth - 0.25) {
+  } else if (absOffset <= roadHalfWidth) {
+    surface = 'asphalt';
+  } else if (absOffset <= roadHalfWidth + TRACK_KERB_WIDTH) {
     surface = 'kerb';
+  } else if (absOffset <= barrierHalfWidth - 0.2) {
+    // FIA painted asphalt runoff zone (safe runoff area inside barriers)
+    surface = 'kerb';
+  } else {
+    // Terrain past barriers / runoff limits
+    surface = 'grass';
   }
 
   const rightBarrierLimit = inPitAlleyLongitudinal

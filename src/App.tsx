@@ -25,6 +25,14 @@ import {
   signOutGoogleUser,
   subscribeAuthUser,
   subscribeHallOfFameData,
+  createCloudLobby,
+  joinCloudLobby,
+  leaveCloudLobby,
+  updateCloudRoom,
+  updateCloudPlayerTelemetry,
+  sendCloudLobbyChat,
+  subscribeCloudRoom,
+  subscribeCloudLobbies,
 } from './firebase';
 import { RaceAudioEngine } from './game/audio';
 import {
@@ -214,6 +222,7 @@ export default function App() {
   const remotePlayersRef = useRef<Map<string, MultiplayerPlayerDTO>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const cloudRoomUnsubRef = useRef<(() => void) | null>(null);
 
   // Input tracking refs
   const keysHeldRef = useRef<Set<string>>(new Set());
@@ -512,6 +521,51 @@ export default function App() {
     setPublicLobbies(fallbackList);
   }, []);
 
+  const setupCloudRoomListener = useCallback(
+    (roomId: string) => {
+      cloudRoomUnsubRef.current?.();
+      cloudRoomUnsubRef.current = subscribeCloudRoom(roomId, (remoteRoom) => {
+        if (!remoteRoom) return;
+        const prevPlayerCount = activeRoomRef.current?.players.length ?? 0;
+        activeRoomRef.current = remoteRoom;
+        setActiveRoom(remoteRoom);
+        writeLocalRoom(remoteRoom);
+
+        if (remoteRoom.trackId !== selectedTrackIdRef.current) {
+          selectedTrackIdRef.current = remoteRoom.trackId;
+          setSelectedTrackId(remoteRoom.trackId);
+          rebuildSceneTrackRef.current?.(remoteRoom.trackId);
+        }
+        if (remoteRoom.botCount !== botCountRef.current) {
+          botCountRef.current = remoteRoom.botCount;
+          setBotCount(remoteRoom.botCount);
+        }
+        if (remoteRoom.botDifficulty !== botDifficultyRef.current) {
+          botDifficultyRef.current = remoteRoom.botDifficulty;
+          setBotDifficulty(remoteRoom.botDifficulty);
+        }
+        if (remoteRoom.totalLaps !== totalLapsRef.current) {
+          totalLapsRef.current = remoteRoom.totalLaps;
+          setTotalLaps(remoteRoom.totalLaps);
+        }
+
+        for (const p of remoteRoom.players) {
+          if (p.id !== localPlayerIdRef.current) {
+            remotePlayersRef.current.set(p.id, p);
+          }
+        }
+        if (remoteRoom.players.length !== prevPlayerCount) {
+          rebuildCarsRef.current?.();
+        }
+
+        if (remoteRoom.status === 'racing' && phaseRef.current === 'title') {
+          updatePhase('playing');
+        }
+      });
+    },
+    [updatePhase]
+  );
+
   const handleCreateLobby = useCallback(
     async (customCode?: string) => {
       setLobbyError(null);
@@ -597,6 +651,11 @@ export default function App() {
         // Seamless local + BroadcastChannel fallback
       }
 
+      // Sync into Firestore cloud lobbies for universal access
+      createCloudLobby(createdRoom)
+        .then(() => setupCloudRoomListener(createdRoom.roomId))
+        .catch(() => {});
+
       writeLocalRoom(createdRoom);
       activeRoomRef.current = createdRoom;
       setActiveRoom(createdRoom);
@@ -613,7 +672,7 @@ export default function App() {
         compound
       );
     },
-    [connectRoomWebSocket]
+    [connectRoomWebSocket, setupCloudRoomListener]
   );
 
   const handleJoinLobby = useCallback(
@@ -626,6 +685,30 @@ export default function App() {
       }
       const spec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
       const compound = selectedCompoundRef.current;
+
+      const selfPlayer: MultiplayerPlayerDTO = {
+        id: localPlayerIdRef.current,
+        name: playerNameRef.current || 'Jezdec',
+        carSpecId: spec.id,
+        colorHex: spec.colorHex,
+        tireCompound: compound,
+        isReady: true,
+        isHost: false,
+        x: 0,
+        y: 0,
+        z: 0,
+        heading: 0,
+        speedKmh: 0,
+        steerAngle: 0,
+        chassisPitch: 0,
+        chassisRoll: 0,
+        isDrifting: false,
+        nitroActive: false,
+        lap: 1,
+        totalDistanceDriven: 0,
+        finished: false,
+        finishTimeMs: null,
+      };
 
       let joinedRoom: LobbyRoomDTO | null = null;
       try {
@@ -657,29 +740,7 @@ export default function App() {
       if (!joinedRoom) {
         const localRooms = readLocalRooms();
         const existingLocal = localRooms[clean];
-        const selfPlayer: MultiplayerPlayerDTO = {
-          id: localPlayerIdRef.current,
-          name: playerNameRef.current || 'Jezdec',
-          carSpecId: spec.id,
-          colorHex: spec.colorHex,
-          tireCompound: compound,
-          isReady: true,
-          isHost: !existingLocal,
-          x: 0,
-          y: 0,
-          z: 0,
-          heading: 0,
-          speedKmh: 0,
-          steerAngle: 0,
-          chassisPitch: 0,
-          chassisRoll: 0,
-          isDrifting: false,
-          nitroActive: false,
-          lap: 1,
-          totalDistanceDriven: 0,
-          finished: false,
-          finishTimeMs: null,
-        };
+        selfPlayer.isHost = !existingLocal;
 
         if (existingLocal) {
           const others = existingLocal.players.filter(
@@ -713,6 +774,16 @@ export default function App() {
         }
       }
 
+      // Sync into Firestore cloud room for universal cross-device multiplayer
+      joinCloudLobby(clean, selfPlayer)
+        .then((cloudRoom) => {
+          if (cloudRoom) {
+            setupCloudRoomListener(cloudRoom.roomId);
+          }
+        })
+        .catch(() => {});
+      setupCloudRoomListener(joinedRoom.roomId);
+
       writeLocalRoom(joinedRoom);
       activeRoomRef.current = joinedRoom;
       setActiveRoom(joinedRoom);
@@ -739,10 +810,10 @@ export default function App() {
         compound
       );
     },
-    [connectRoomWebSocket]
+    [connectRoomWebSocket, setupCloudRoomListener]
   );
 
-  // Subscribe to Firebase Auth & Hall of Fame data
+  // Subscribe to Firebase Auth, Hall of Fame, and live Cloud Lobbies
   useEffect(() => {
     const unsubAuth = subscribeAuthUser((u) => {
       authUserRef.current = u;
@@ -761,15 +832,24 @@ export default function App() {
       (drivers) => setHallOfFameDrivers(drivers),
       (laps) => setHallOfFameLaps(laps)
     );
+    const unsubLobbies = subscribeCloudLobbies((cloudList) => {
+      if (cloudList && cloudList.length > 0) {
+        setPublicLobbies(cloudList);
+      }
+    });
     return () => {
       unsubAuth();
       unsubHof();
+      unsubLobbies();
     };
   }, []);
 
   const handleSignInGoogle = useCallback(async () => {
     try {
-      await signInWithGooglePopup();
+      const res = await signInWithGooglePopup();
+      if (res.error) {
+        setLobbyError(res.error);
+      }
     } catch {
       // Popup closed by user
     }
@@ -851,6 +931,15 @@ export default function App() {
           }
         })
         .catch(() => {});
+
+      // Sync into Firestore cloud room so cross-device and external host players see updates instantly
+      updateCloudRoom(updatedRoom.roomId, {
+        ...updatedRoom,
+        trackId: settingsUpdate?.trackId ?? updatedRoom.trackId,
+        totalLaps: settingsUpdate?.totalLaps ?? updatedRoom.totalLaps,
+        botCount: settingsUpdate?.botCount ?? updatedRoom.botCount,
+        botDifficulty: settingsUpdate?.botDifficulty ?? updatedRoom.botDifficulty,
+      }).catch(() => {});
     },
     []
   );
@@ -955,16 +1044,21 @@ export default function App() {
         chatText: newMsg.text,
       }),
     }).catch(() => {});
+    // Cloud lobby chat sync
+    sendCloudLobbyChat(room.roomId, newMsg).catch(() => {});
   }, []);
 
   const handleLeaveLobby = useCallback(() => {
     const room = activeRoomRef.current;
+    cloudRoomUnsubRef.current?.();
+    cloudRoomUnsubRef.current = null;
     if (room) {
       fetch(`/api/lobbies/${room.roomId}/leave`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ playerId: localPlayerIdRef.current }),
       }).catch(() => {});
+      leaveCloudLobby(room.roomId, localPlayerIdRef.current).catch(() => {});
     }
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'room:leave' }));
@@ -1011,6 +1105,11 @@ export default function App() {
           playerId: localPlayerIdRef.current,
           action: 'start',
         }),
+      }).catch(() => {});
+
+      updateCloudRoom(updatedRoom.roomId, {
+        status: 'racing',
+        raceStartedAt: Date.now(),
       }).catch(() => {});
     }
     rebuildCarsRef.current?.();
@@ -2038,6 +2137,7 @@ export default function App() {
           }
           if (now - lastHttpFallbackSyncTime > 300) {
             lastHttpFallbackSyncTime = now;
+            updateCloudPlayerTelemetry(activeRoomRef.current.roomId, payload as any).catch(() => {});
             fetch(`/api/lobbies/${activeRoomRef.current.roomId}/sync`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },

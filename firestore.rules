@@ -25,7 +25,7 @@ service cloud.firestore {
     }
 
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn() && (request.auth.token.email_verified == true || request.auth.token.firebase.sign_in_provider == 'google.com' || request.auth.token.firebase.sign_in_provider == 'anonymous');
     }
 
     // Pillar 2: Validation Blueprint for DriverStanding
@@ -220,6 +220,13 @@ service cloud.firestore {
         );
 
       allow delete: if false;
+    }
+
+    // Collection 3: Real-Time Cross-Device Multiplayer Lobbies
+    match /multiplayer_lobbies/{roomId} {
+      allow get, list: if true;
+      allow create, update: if isValidId(roomId);
+      allow delete: if isSignedIn();
     }
   }
 }
