@@ -1,14 +1,23 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  TRACK_DEFINITIONS,
   setActiveTrack,
   getTrackSamples,
   getTrackTotalLength,
   buildProceduralTrackDefinition,
+  buildCustomTrackDefinition,
+  registerCustomTrack,
+  renameCustomTrack,
+  deleteCustomTrack,
+  getCustomTracks,
+  encodeCustomTrackShareCode,
+  decodeCustomTrackShareCode,
 } from './track.ts';
 import {
   CAR_SPECS,
   DEFAULT_TUNING,
+  RACE_GAME_MODES,
   createInitialCarState,
   stepCarPhysics,
   computeAiInput,
@@ -26,8 +35,29 @@ const NO_INPUT: CarInput = {
   nitro: false,
 };
 
-describe('Track geometry and procedural generator', () => {
-  it('generates 360 smooth closed-loop samples for presets and procedural seeds without pinching', () => {
+describe('Track geometry, 12 presets, Figure-8 3D bridges, and custom track sharing', () => {
+  it('provides 12 handcrafted preset circuits including Figure-8 bridge tracks', () => {
+    assert.equal(
+      TRACK_DEFINITIONS.length,
+      12,
+      `Expected 12 preset circuits, got ${TRACK_DEFINITIONS.length}`
+    );
+    const bridgePresets = TRACK_DEFINITIONS.filter((t) => t.hasBridge);
+    assert.ok(
+      bridgePresets.length >= 3,
+      `Expected at least 3 Figure-8 bridge circuits, got ${bridgePresets.length}`
+    );
+
+    setActiveTrack('suzuka-8-gp');
+    const suzukaSamples = getTrackSamples('suzuka-8-gp');
+    assert.equal(suzukaSamples.length, 360);
+    assert.ok(
+      suzukaSamples.some((s) => s.isBridge && s.y > 4.0),
+      'Suzuka Figure-8 track must contain elevated 3D bridge samples (isBridge && y > 4.0)'
+    );
+  });
+
+  it('generates 360 smooth closed-loop samples for presets, procedural seeds, and custom 2D editor checkpoints with Figure-8 bridges', () => {
     setActiveTrack('alpine');
     const samples = getTrackSamples();
     assert.equal(samples.length, 360);
@@ -42,10 +72,118 @@ describe('Track geometry and procedural generator', () => {
       assert.equal(procSamples.length, 360);
       assert.ok(getTrackTotalLength() > 900, `Procedural track seed ${seed} should have >900m length`);
     }
+
+    // Test custom 2D-to-3D Track Editor builder with a crossing Figure-8 shape (automatic 3D bridge elevation)
+    const figure8Points: Array<[number, number, number]> = [
+      [58, 0.5, 130],
+      [175, 2.5, 145],
+      [215, 2.0, 50],
+      [115, 0.0, 0], // Crosses toward bottom-left
+      [45, 0.0, -135],
+      [165, 2.5, -145],
+      [220, 4.0, -45],
+      [115, 6.5, 0], // Crosses over the first diagonal -> auto-elevated into a 3D bridge!
+    ];
+    const customDef = buildCustomTrackDefinition(
+      'custom-test-figure8',
+      'Custom Figure-8 GP',
+      figure8Points,
+      0,
+      9.4
+    );
+    assert.equal(
+      customDef.hasBridge,
+      true,
+      'Crossing custom track must automatically detect intersection and enable hasBridge'
+    );
+    registerCustomTrack(customDef);
+    setActiveTrack('custom-test-figure8');
+    const customSamples = getTrackSamples('custom-test-figure8');
+    assert.equal(customSamples.length, 360);
+    assert.ok(
+      customSamples.some((s) => s.isBridge && s.y >= 4.0),
+      'Crossing custom track must generate elevated 3D bridge samples'
+    );
+    assert.ok(
+      Math.abs(customSamples[0].x) < 0.01,
+      'Start/finish straight must be anchored at x = 0 for 3D pit lane'
+    );
+
+    // Test Rename, Share Code Encode/Decode, and Delete for Custom Tracks
+    const savedCustom = buildCustomTrackDefinition(
+      'custom-unit-test',
+      'Moje Testovací Trať',
+      [
+        [60, 1.5, 120],
+        [160, 3.0, 90],
+        [160, 2.0, -90],
+        [60, 0.5, -120],
+      ]
+    );
+    const shareCode = encodeCustomTrackShareCode(savedCustom);
+    assert.ok(shareCode.length > 10, 'Share code should be non-empty base64url string');
+    const decoded = decodeCustomTrackShareCode(shareCode);
+    assert.ok(decoded, 'Decoded custom track should not be null');
+    assert.equal(decoded?.name, 'Moje Testovací Trať');
+    assert.equal(decoded?.rawUserCheckpoints?.length, 4);
+
+    const renamed = renameCustomTrack('custom-unit-test', 'Přejmenovaná Trať GP');
+    assert.equal(renamed?.name, 'Přejmenovaná Trať GP');
+
+    deleteCustomTrack('custom-unit-test');
+    assert.ok(
+      !getCustomTracks().some((t) => t.id === 'custom-unit-test'),
+      'Deleted custom track should be removed from custom tracks list'
+    );
   });
 });
 
-describe('Formula 3D physics, continuous standings, and tire wear system', () => {
+describe('Formula 3D physics, continuous standings, game modes, and tire wear system', () => {
+  it('defines GP, Elimination, and Checkpoint game modes and ranks active cars ahead of eliminated cars', () => {
+    assert.ok(RACE_GAME_MODES.gp);
+    assert.ok(RACE_GAME_MODES.elimination);
+    assert.ok(RACE_GAME_MODES.checkpoint);
+
+    setActiveTrack('alpine');
+    const activeCar = createInitialCarState(
+      'car-active',
+      'Active Driver',
+      true,
+      CAR_SPECS[0],
+      0.05,
+      0,
+      'soft'
+    );
+    const eliminatedCar = createInitialCarState(
+      'car-elim',
+      'Eliminated Driver',
+      false,
+      CAR_SPECS[1],
+      0.25,
+      0,
+      'soft'
+    );
+    eliminatedCar.eliminated = true;
+
+    const standings = computeRaceStandings([eliminatedCar, activeCar]);
+    assert.equal(
+      standings[0].id,
+      'car-active',
+      'Active non-eliminated car must rank ahead of eliminated car regardless of distance'
+    );
+
+    // Verify Danger Zone Overcharge boosts ERS recovery for the car in last place
+    activeCar.nitroAmount = 30;
+    activeCar.inDangerZone = true;
+    for (let i = 0; i < 10; i++) {
+      stepCarPhysics(activeCar, { ...NO_INPUT, throttle: 1 }, DEFAULT_TUNING, 0.05, 3);
+    }
+    assert.ok(
+      activeCar.nitroAmount > 33.5,
+      `Danger Zone Overcharge should rapidly recharge ERS, got ${activeCar.nitroAmount}`
+    );
+  });
+
   it('accelerates Formula car forward and smoothly returns steering to center', () => {
     setActiveTrack('alpine');
     const player = createInitialCarState(
@@ -128,6 +266,41 @@ describe('Formula 3D physics, continuous standings, and tire wear system', () =>
       `Expected smooth unwrappedProgress across start line, got ${trailingCar.unwrappedProgress}`
     );
     assert.equal(trailingCar.finished, false, 'Race must not randomly finish on lap 1 start');
+
+    // Verify millimeter-precision overtaking within the SAME 3-meter sample segment!
+    const carBehind = createInitialCarState(
+      'car-behind',
+      'Behind',
+      true,
+      CAR_SPECS[0],
+      0.241,
+      0,
+      'soft'
+    );
+    const carAhead = createInitialCarState(
+      'car-ahead',
+      'Ahead',
+      false,
+      CAR_SPECS[1],
+      0.2415,
+      0,
+      'soft'
+    );
+    assert.equal(
+      computeRaceStandings([carBehind, carAhead])[0].id,
+      'car-ahead',
+      'Car 0.05% (0.6m) ahead within the same sample segment must be P1'
+    );
+
+    // Move carBehind forward by 1.2 meters so it overtakes carAhead within the same sample segment
+    carBehind.x += Math.sin(carBehind.heading) * 1.2;
+    carBehind.z += Math.cos(carBehind.heading) * 1.2;
+    stepCarPhysics(carBehind, NO_INPUT, DEFAULT_TUNING, 1 / 60, 3);
+    assert.equal(
+      computeRaceStandings([carBehind, carAhead])[0].id,
+      'car-behind',
+      'Overtaking by 0.6m within the same spline segment must immediately promote carBehind to P1'
+    );
   });
 
   it('gradually wears down 4 tires with distance and cornering and restores them via pit stop', () => {
@@ -249,7 +422,7 @@ describe('Formula 3D physics, continuous standings, and tire wear system', () =>
     assert.equal(pitCar.inPitBox, true, 'Car inside right-side pit lane alley stall at t=0.99, lat=10.8m should trigger inPitBox');
   });
 
-  it('assigns distinct racing strategies to AI bots and executes physical AI pit stops when tires wear down', () => {
+  it('assigns distinct racing strategies to AI bots and executes physical AI pit stops (~2.85s-4.05s minigame-equivalent duration) when tires wear down', () => {
     setActiveTrack('alpine');
     const aiAggressive = createInitialCarState(
       'ai-0',
@@ -297,14 +470,14 @@ describe('Formula 3D physics, continuous standings, and tire wear system', () =>
     );
     assert.ok(aiIn.throttle > 0, 'AI should drive toward the Pit Lane Alley');
 
-    // Place AI inside the Pit Box stall in the Pit Lane Alley and run through the 2.2s stationary pit stop service
+    // Place AI inside the Pit Box stall in the Pit Lane Alley and run through the ~2.85s stationary pit stop service
     aiAggressive.x = -11.2;
     aiAggressive.z = -5.0;
     aiAggressive.forwardSpeed = 12;
     aiAggressive.vx = 0;
     aiAggressive.vz = 12;
 
-    for (let step = 0; step < 180; step++) {
+    for (let step = 0; step < 240; step++) {
       const input = computeAiInput(aiAggressive, 0, 0.9, 'clear');
       stepCarPhysics(aiAggressive, input, DEFAULT_TUNING, 1 / 60, 5, 1.0);
     }
@@ -312,7 +485,7 @@ describe('Formula 3D physics, continuous standings, and tire wear system', () =>
     assert.equal(
       aiAggressive.pitStopsCompleted,
       1,
-      'AI should complete its pit stop in the Pit Lane Alley'
+      'AI should complete its pit stop in the Pit Lane Alley after realistic minigame duration'
     );
     assert.ok(
       aiAggressive.tireHealth > 95,
@@ -398,3 +571,4 @@ describe('Formula 3D physics, continuous standings, and tire wear system', () =>
     );
   });
 });
+

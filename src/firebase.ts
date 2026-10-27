@@ -186,14 +186,14 @@ export async function ensureDriverProfileExists(user: User): Promise<void> {
   const isGoogle = user.providerData?.some((p) => p.providerId === 'google.com');
   if (!user.emailVerified && !isGoogle) return;
   const uid = sanitizeId(user.uid);
-  const path = `hall_of_fame_drivers/${uid}`;
   const ref = doc(db, 'hall_of_fame_drivers', uid);
   let exists = false;
   try {
     const snap = await getDoc(ref);
     exists = snap.exists();
   } catch (error) {
-    handleFirestoreError(error, OperationType.GET, path);
+    console.warn('[Firestore] Nelze načíst profil jezdce:', error);
+    return;
   }
 
   if (!exists) {
@@ -215,7 +215,7 @@ export async function ensureDriverProfileExists(user: User): Promise<void> {
         updatedAt: serverTimestamp(),
       });
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      console.warn('[Firestore] Nelze vytvořit profil jezdce:', error);
     }
   }
 }
@@ -529,7 +529,8 @@ export function subscribeHallOfFameData(
       onDrivers(list);
     },
     (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'hall_of_fame_drivers');
+      console.warn('[Firestore] Hall of Fame drivers listener warning:', error);
+      onDrivers([]);
     }
   );
 
@@ -559,7 +560,8 @@ export function subscribeHallOfFameData(
       onLaps(list);
     },
     (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'hall_of_fame_laps');
+      console.warn('[Firestore] Hall of Fame laps listener warning:', error);
+      onLaps([]);
     }
   );
 

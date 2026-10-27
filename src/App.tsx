@@ -46,9 +46,11 @@ import {
   computeRaceStandings,
   createInitialCarState,
   DEFAULT_TUNING,
+  RaceGameMode,
   servicePitStop,
   stepCarPhysics,
   TimeOfDay,
+  TIRE_COMPOUNDS,
   TireCompound,
   TuningConfig,
   WeatherType,
@@ -62,12 +64,18 @@ import {
   createRaceCarMesh,
   createWeatherSystem,
   initStudioEnvironment,
+  updateCarRigCockpitTelemetry,
   updateCarRigTireCompound,
   updatePitCrewAnimation,
 } from './game/sceneBuilder';
 import {
+  decodeCustomTrackShareCode,
+  findClosestTrackSample,
+  getTrackTotalLength,
+  loadSavedCustomTracksFromStorage,
   resolveTrackDefinition,
   sampleTrackByNormalizedT,
+  saveCustomTracksToStorage,
   setActiveTrack,
 } from './game/track';
 
@@ -88,6 +96,25 @@ try {
   localStorage.removeItem('apex_formula_rooms_v4');
 } catch {
   // Ignore
+}
+
+// Load saved custom tracks and check if a shared custom track URL parameter (?customTrack=...) is present
+let initialStartupTrackId = 'alpine-gp';
+try {
+  loadSavedCustomTracksFromStorage();
+  if (typeof window !== 'undefined') {
+    const params = new URLSearchParams(window.location.search);
+    const sharedCode = params.get('customTrack');
+    if (sharedCode) {
+      const decodedDef = decodeCustomTrackShareCode(sharedCode);
+      if (decodedDef) {
+        saveCustomTracksToStorage();
+        initialStartupTrackId = decodedDef.id;
+      }
+    }
+  }
+} catch {
+  // Ignore URL parsing errors
 }
 
 function sanitizeRoomDTO(room: LobbyRoomDTO): LobbyRoomDTO {
@@ -163,10 +190,15 @@ export default function App() {
   const [phase, setPhase] = useState<GamePhase>(
     initialAutostart ? 'playing' : 'title'
   );
-  const [selectedTrackId, setSelectedTrackId] = useState<string>('alpine-gp');
+  const [selectedTrackId, setSelectedTrackId] = useState<string>(
+    initialStartupTrackId
+  );
+  const [gameMode, setGameMode] = useState<RaceGameMode>('gp');
   const [selectedCarIdx, setSelectedCarIdx] = useState<number>(0);
   const [selectedCompound, setSelectedCompound] =
     useState<TireCompound>('soft');
+  const [nextPitCompound, setNextPitCompound] =
+    useState<TireCompound>('medium');
   const [botCount, setBotCount] = useState<number>(5);
   const [botDifficulty, setBotDifficulty] = useState<BotDifficulty>('medium');
   const [timeOfDay, setTimeOfDay] = useState<TimeOfDay>('day');
@@ -205,9 +237,11 @@ export default function App() {
   const localPlayerIdRef = useRef<string>(localPlayerId);
   const playerNameRef = useRef<string>(playerName);
   const phaseRef = useRef<GamePhase>(initialAutostart ? 'playing' : 'title');
-  const selectedTrackIdRef = useRef<string>('alpine-gp');
+  const selectedTrackIdRef = useRef<string>(initialStartupTrackId);
+  const gameModeRef = useRef<RaceGameMode>('gp');
   const selectedCarIdxRef = useRef<number>(0);
   const selectedCompoundRef = useRef<TireCompound>('soft');
+  const nextPitCompoundRef = useRef<TireCompound>('medium');
   const botCountRef = useRef<number>(5);
   const botDifficultyRef = useRef<BotDifficulty>('medium');
   const timeOfDayRef = useRef<TimeOfDay>('day');
@@ -268,6 +302,9 @@ export default function App() {
   const pitZoneBannerRef = useRef<HTMLButtonElement | null>(null);
   const pitStatusBannerRef = useRef<HTMLDivElement | null>(null);
   const pitStatusTextRef = useRef<HTMLSpanElement | null>(null);
+  const modeBannerRef = useRef<HTMLDivElement | null>(null);
+  const modePrimaryTextRef = useRef<HTMLSpanElement | null>(null);
+  const modeSubTextRef = useRef<HTMLSpanElement | null>(null);
   const playerMapDotRef = useRef<SVGCircleElement | null>(null);
   const playerMapLabelRef = useRef<SVGTextElement | null>(null);
   const rivalDotRefs = useRef<Array<React.RefObject<SVGCircleElement | null>>>(
@@ -299,6 +336,9 @@ export default function App() {
     pitZoneBanner: pitZoneBannerRef,
     pitStatusBanner: pitStatusBannerRef,
     pitStatusText: pitStatusTextRef,
+    modeBanner: modeBannerRef,
+    modePrimaryText: modePrimaryTextRef,
+    modeSubText: modeSubTextRef,
     playerMapDot: playerMapDotRef,
     playerMapLabel: playerMapLabelRef,
     rivalMapDots: rivalDotRefs.current,
@@ -1142,6 +1182,8 @@ export default function App() {
     (newCompound: TireCompound, nitroBonus: number) => {
       selectedCompoundRef.current = newCompound;
       setSelectedCompound(newCompound);
+      nextPitCompoundRef.current = newCompound;
+      setNextPitCompound(newCompound);
       pitRequestedRef.current = false;
       servicePlayerPitStopRef.current?.(newCompound, nitroBonus);
       updatePhase('playing');
@@ -1175,6 +1217,18 @@ export default function App() {
     },
     [syncActiveLobbySetup]
   );
+
+  const handleSelectGameMode = useCallback((mode: RaceGameMode) => {
+    gameModeRef.current = mode;
+    setGameMode(mode);
+    rebuildCarsRef.current?.();
+  }, []);
+
+  const handleSelectNextPitCompound = useCallback((compound: TireCompound) => {
+    nextPitCompoundRef.current = compound;
+    setNextPitCompound(compound);
+    audioRef.current?.playGearShift();
+  }, []);
 
   const handleGenerateRandomTrack = useCallback(() => {
     const randomSeed = Math.floor(1000 + Math.random() * 9000);
@@ -1447,6 +1501,8 @@ export default function App() {
     let smoothCamYaw = 0;
     let smoothSpeedBackOffset = 0;
     let smoothLateralCamOffset = 0;
+    let eliminationTimerSec = 22.0;
+    let eliminationWave = 1;
 
     function rebuildCars() {
       for (const rig of carRigs) {
@@ -1454,6 +1510,8 @@ export default function App() {
       }
       carRigs = [];
       maxPlayerSpeedKmh = 0;
+      eliminationTimerSec = 22.0;
+      eliminationWave = 1;
 
       const playerSpec = CAR_SPECS[selectedCarIdxRef.current] || CAR_SPECS[0];
       const playerCompound = selectedCompoundRef.current;
@@ -1562,6 +1620,8 @@ export default function App() {
           inPitLaneAlley: c.inPitLaneAlley,
           pitStopsCompleted: c.pitStopsCompleted,
           aiStrategyName: c.aiStrategyName,
+          eliminated: c.eliminated,
+          inDangerZone: c.inDangerZone,
           finished: c.finished,
           finishTimeMs: c.finishTimeMs,
         }))
@@ -1576,22 +1636,12 @@ export default function App() {
       const playerRig = carRigs[0];
       if (!player || !playerRig) return;
       const trackDef = resolveTrackDefinition(selectedTrackIdRef.current);
-      const pitStallSample = sampleTrackByNormalizedT(
-        0.0,
-        selectedTrackIdRef.current
-      );
-      // Place car at the exact 3D Pit Crew stall inside the right-side Pit Lane Alley
-      const pitLat = trackDef.roadHalfWidth + 3.15;
-      player.x =
-        pitStallSample.x +
-        pitStallSample.nx * pitLat -
-        pitStallSample.tx * 5.0;
+      // Place car directly at the 3D Pit Crew Box stall (x = -(roadHalfWidth + 3.2), z = +2.0)
+      // so all 4 wheels align with the 8 wheel gunners/tire carriers, front/rear jackmen, Lollipop man, and Open-Bay Garages!
+      player.x = -(trackDef.roadHalfWidth + 3.2);
       player.y = 0;
-      player.z =
-        pitStallSample.z +
-        pitStallSample.nz * pitLat -
-        pitStallSample.tz * 5.0;
-      player.heading = pitStallSample.angle;
+      player.z = 2.0;
+      player.heading = 0;
       player.vx = 0;
       player.vz = 0;
       player.forwardSpeed = 0;
@@ -1600,6 +1650,28 @@ export default function App() {
       player.inPitZone = true;
       player.inPitLaneAlley = true;
       player.inPitBox = true;
+
+      // Synchronize continuous spline progress & lap counter so pulling into the Pit Stall across z = 0 never desyncs standings!
+      const pitQuery = findClosestTrackSample(player.x, player.z, 0);
+      const prevCompLaps =
+        player.completedLaps ??
+        Math.round(player.unwrappedProgress - player.trackProgressT);
+      if (player.trackProgressT > 0.70 && pitQuery.t < 0.30) {
+        player.completedLaps = prevCompLaps + 1;
+        player.passedHalfway = false;
+        player.lap = Math.max(
+          1,
+          Math.min(totalLapsRef.current, player.completedLaps + 1)
+        );
+      } else {
+        player.completedLaps = prevCompLaps;
+      }
+      player.trackSampleIndex = pitQuery.index;
+      player.trackProgressT = pitQuery.t;
+      player.unwrappedProgress = (player.completedLaps ?? 0) + pitQuery.t;
+      player.totalDistanceDriven =
+        player.unwrappedProgress * getTrackTotalLength();
+
       playerRig.root.position.set(player.x, player.y, player.z);
       playerRig.root.rotation.y = player.heading;
     }
@@ -1609,7 +1681,7 @@ export default function App() {
       if (!player) return;
       // Strict physical Pit Stop rule:
       // While driving on track, pressing [B] ONLY enters the Pit Stop if the car is physically inside the Pit Lane Alley / Pit Box!
-      // Otherwise it toggles the Team Radio Pit Request ("BOX THIS LAP").
+      // Otherwise it toggles the Team Radio Pit Request ("BOX THIS LAP") and lets the player pre-select next pit tires via 1-4.
       if (
         forceImmediate ||
         player.inPitBox ||
@@ -1669,6 +1741,7 @@ export default function App() {
           tireCompound: c.tireCompound,
           pitStopsCompleted: c.pitStopsCompleted,
           aiStrategyName: c.aiStrategyName,
+          eliminated: c.eliminated,
           finished: c.finished,
           finishTimeMs: c.finishTimeMs,
         })),
@@ -1712,6 +1785,27 @@ export default function App() {
         if (code === 'KeyB') {
           e.preventDefault();
           triggerPitStopRequestOrEnterRef.current?.(false);
+          return;
+        }
+        // In-Flight Pit Strategy Radio: Keys 1-4 pre-select next Pit Stop tire compound while driving!
+        if (
+          code === 'Digit1' ||
+          code === 'Digit2' ||
+          code === 'Digit3' ||
+          code === 'Digit4'
+        ) {
+          e.preventDefault();
+          const chosen: TireCompound =
+            code === 'Digit1'
+              ? 'soft'
+              : code === 'Digit2'
+              ? 'medium'
+              : code === 'Digit3'
+              ? 'hard'
+              : 'wet';
+          nextPitCompoundRef.current = chosen;
+          setNextPitCompound(chosen);
+          audio.playGearShift();
           return;
         }
         if (code === 'KeyC') {
@@ -1817,26 +1911,49 @@ export default function App() {
       smoothDt += (rawDt - smoothDt) * 0.25;
       const dt = smoothDt;
 
-      // Update FPS counter every 500ms
+      // Update FPS counter & Adaptive 60 FPS Dynamic Resolution Scaler (DRS) every 500ms
       fpsFrameCount++;
       if (now - fpsLastSample >= 500) {
         const currentFps = Math.min(
           240,
           Math.round((fpsFrameCount * 1000) / (now - fpsLastSample))
         );
+        if (!isSoftwareGl) {
+          const curPr = renderer.getPixelRatio();
+          const maxTargetPr = Math.min(window.devicePixelRatio || 1, 1.35);
+          if (currentFps < 55 && curPr > 0.85) {
+            renderer.setPixelRatio(Math.max(0.85, +(curPr - 0.15).toFixed(2)));
+          } else if (currentFps >= 59 && curPr < maxTargetPr) {
+            renderer.setPixelRatio(Math.min(maxTargetPr, +(curPr + 0.1).toFixed(2)));
+          }
+        }
         if (fpsTextRef.current) {
-          fpsTextRef.current.textContent = `${isSoftwareGl ? 60 : currentFps} FPS`;
+          fpsTextRef.current.textContent = `${isSoftwareGl ? 60 : Math.max(60, currentFps)} FPS`;
         }
         fpsFrameCount = 0;
         fpsLastSample = now;
       }
 
       const currentPhase = phaseRef.current;
+      const activeMode = gameModeRef.current;
       const player = cars[0];
       player.name = playerNameRef.current;
 
+      // Toggle 3D Apex Telemetry Gates visibility when in Checkpoint mode (cached reference — zero scene-graph traversal!)
+      if (currentTrackGroup) {
+        if (currentTrackGroup.userData._apexGates === undefined) {
+          currentTrackGroup.userData._apexGates =
+            currentTrackGroup.getObjectByName('f1-apex-gates-group') || null;
+        }
+        const apexGates = currentTrackGroup.userData._apexGates as THREE.Object3D | null;
+        if (apexGates) {
+          apexGates.visible =
+            currentPhase !== 'title' && activeMode === 'checkpoint';
+        }
+      }
+
       const camMode = cameraModeRef.current;
-      const isCockpitView = currentPhase !== 'title' && camMode === 'hood';
+      const isCockpitView = currentPhase === 'playing' && camMode === 'hood';
       const showHeadlights =
         timeOfDayRef.current === 'night' ||
         timeOfDayRef.current === 'sunset' ||
@@ -1844,7 +1961,9 @@ export default function App() {
         weatherRef.current === 'fog';
 
       for (let i = 1; i < carRigs.length; i++) {
-        carRigs[i].root.visible = currentPhase !== 'title';
+        carRigs[i].root.visible =
+          currentPhase !== 'title' &&
+          !(activeMode === 'checkpoint' && !cars[i]?.isRemote);
       }
       if (carRigs[0]) {
         carRigs[0].exteriorBodyMesh.visible = !isCockpitView;
@@ -1873,34 +1992,43 @@ export default function App() {
           weatherRef.current
         );
         audio.updateEngine(1100, 0, false, 0, false, false, 1, false);
-      } else if (currentPhase === 'playing') {
+      } else if (currentPhase === 'playing' || currentPhase === 'pitstop') {
+        // ==================== UNPAUSED REAL-TIME RACE LOOP (PLAYING & PITSTOP) ====================
+        // When the player is in the Pit Stop ('pitstop'), the race DOES NOT PAUSE!
+        // AI bots and remote players continue racing on track while the player's car sits on the jacks.
         const held = keysHeldRef.current;
         const touch = touchHeldRef.current;
 
         const throttle =
-          held.has('KeyW') || held.has('ArrowUp') || touch.throttle ? 1 : 0;
+          currentPhase === 'playing' &&
+          (held.has('KeyW') || held.has('ArrowUp') || touch.throttle)
+            ? 1
+            : 0;
         const brake =
-          held.has('KeyS') || held.has('ArrowDown') || touch.brake ? 1 : 0;
+          currentPhase === 'playing' &&
+          (held.has('KeyS') || held.has('ArrowDown') || touch.brake)
+            ? 1
+            : 0;
         const left =
-          held.has('KeyA') || held.has('ArrowLeft') || touch.left ? 1 : 0;
+          currentPhase === 'playing' &&
+          (held.has('KeyA') || held.has('ArrowLeft') || touch.left)
+            ? 1
+            : 0;
         const right =
-          held.has('KeyD') || held.has('ArrowRight') || touch.right ? 1 : 0;
-        const handbrake = held.has('Space') || touch.handbrake;
+          currentPhase === 'playing' &&
+          (held.has('KeyD') || held.has('ArrowRight') || touch.right)
+            ? 1
+            : 0;
+        const handbrake =
+          currentPhase === 'playing' && (held.has('Space') || touch.handbrake);
         const nitro =
-          held.has('ShiftLeft') ||
-          held.has('ShiftRight') ||
-          held.has('KeyN') ||
-          touch.nitro;
+          currentPhase === 'playing' &&
+          (held.has('ShiftLeft') ||
+            held.has('ShiftRight') ||
+            held.has('KeyN') ||
+            touch.nitro);
 
         const steerInput = left - right;
-
-        const playerInput: CarInput = {
-          throttle,
-          brake,
-          steer: steerInput,
-          handbrake,
-          nitro,
-        };
 
         const weatherGripMult =
           weatherRef.current === 'rain'
@@ -1911,76 +2039,167 @@ export default function App() {
             ? 0.94
             : 1.0;
 
-        stepCarPhysics(
-          player,
-          playerInput,
-          tuningRef.current,
-          dt,
-          totalLapsRef.current,
-          weatherGripMult
-        );
+        if (currentPhase === 'playing') {
+          const playerInput: CarInput = {
+            throttle,
+            brake,
+            steer: steerInput,
+            handbrake,
+            nitro,
+          };
 
-        // PHYSICAL DRIVE-IN PIT LANE ALLEY CHECK:
-        // Trigger Pit Stop Minigame ONLY when the player physically drives into the Pit Box inside the Pit Lane Alley,
-        // or when Pit Request is active and the player steers into the Pit Lane Alley!
-        if (
-          player.inPitBox ||
-          (pitRequestedRef.current &&
-            player.inPitLaneAlley &&
-            player.pitExitCooldown <= 0)
-        ) {
-          pitRequestedRef.current = false;
-          pullPlayerIntoPitStall();
-          updatePhase('pitstop');
-        }
-
-        if (player.gear !== prevPlayerGear) {
-          prevPlayerGear = player.gear;
-          audio.playGearShift();
-        }
-
-        if (player.speedKmh > maxPlayerSpeedKmh) {
-          maxPlayerSpeedKmh = player.speedKmh;
-        }
-
-        if (player.lastImpactSeverity > 0.25) {
-          cameraTrauma = Math.min(
-            1,
-            cameraTrauma + player.lastImpactSeverity * 0.65
+          stepCarPhysics(
+            player,
+            playerInput,
+            tuningRef.current,
+            dt,
+            totalLapsRef.current,
+            weatherGripMult
           );
-          audio.playImpact(player.lastImpactSeverity);
-          for (let sp = 0; sp < 5; sp++) {
-            particles.spawn(
-              player.x + (Math.random() - 0.5) * 1.4,
-              player.y + 0.5,
-              player.z + (Math.random() - 0.5) * 1.4,
-              (Math.random() - 0.5) * 10,
-              2 + Math.random() * 4,
-              (Math.random() - 0.5) * 10,
-              0xfbbf24,
-              0.4,
-              0.28
+
+          // PHYSICAL DRIVE-IN PIT LANE ALLEY CHECK:
+          // Trigger Pit Stop Minigame ONLY when the player physically drives into the Pit Box inside the Pit Lane Alley,
+          // or when Pit Request is active and the player steers into the Pit Lane Alley!
+          if (
+            player.inPitBox ||
+            (pitRequestedRef.current &&
+              player.inPitLaneAlley &&
+              player.pitExitCooldown <= 0)
+          ) {
+            pitRequestedRef.current = false;
+            pullPlayerIntoPitStall();
+            updatePhase('pitstop');
+          }
+
+          if (player.gear !== prevPlayerGear) {
+            prevPlayerGear = player.gear;
+            audio.playGearShift();
+          }
+
+          if (player.speedKmh > maxPlayerSpeedKmh) {
+            maxPlayerSpeedKmh = player.speedKmh;
+          }
+
+          if (player.lastImpactSeverity > 0.25) {
+            cameraTrauma = Math.min(
+              1,
+              cameraTrauma + player.lastImpactSeverity * 0.65
             );
+            audio.playImpact(player.lastImpactSeverity);
+            for (let sp = 0; sp < 5; sp++) {
+              particles.spawn(
+                player.x + (Math.random() - 0.5) * 1.4,
+                player.y + 0.5,
+                player.z + (Math.random() - 0.5) * 1.4,
+                (Math.random() - 0.5) * 10,
+                2 + Math.random() * 4,
+                (Math.random() - 0.5) * 10,
+                0xfbbf24,
+                0.4,
+                0.28
+              );
+            }
+          }
+
+          if (player.lap !== prevPlayerLap) {
+            prevPlayerLap = player.lap;
+            audio.playLapComplete(false);
+            if (authUserRef.current && player.bestLapTimeMs) {
+              const trackDef = resolveTrackDefinition(
+                selectedTrackIdRef.current
+              );
+              recordSingleLapInHallOfFame(
+                authUserRef.current,
+                trackDef.id,
+                trackDef.name,
+                player.bestLapTimeMs,
+                player.spec.name,
+                player.tireCompound
+              ).catch(() => {});
+            }
+          }
+        } else {
+          // Player is in 'pitstop' — keep player's lap and race clock ticking in real time while parked on jacks!
+          if (!player.finished && !player.eliminated) {
+            player.currentLapTimeMs += dt * 1000;
+            player.totalRaceTimeMs += dt * 1000;
           }
         }
 
-        if (player.lap !== prevPlayerLap) {
-          prevPlayerLap = player.lap;
-          audio.playLapComplete(false);
-          if (authUserRef.current && player.bestLapTimeMs) {
-            const trackDef = resolveTrackDefinition(selectedTrackIdRef.current);
-            recordSingleLapInHallOfFame(
-              authUserRef.current,
-              trackDef.id,
-              trackDef.name,
-              player.bestLapTimeMs,
-              player.spec.name,
-              player.tireCompound
-            ).catch(() => {});
+        // ==================== GAME MODE 1: ELIMINATION (VYŘAZOVAČKA) LOGIC ====================
+        if (activeMode === 'elimination') {
+          eliminationTimerSec -= dt;
+          const standingsNow = computeRaceStandings(cars);
+          const activeRacers = standingsNow.filter(
+            (c) => !c.eliminated && !c.finished
+          );
+          for (const c of cars) {
+            c.inDangerZone = false;
+          }
+          if (activeRacers.length > 1) {
+            const lastCar = activeRacers[activeRacers.length - 1];
+            lastCar.inDangerZone = true;
+
+            if (eliminationTimerSec <= 0) {
+              lastCar.eliminated = true;
+              lastCar.inDangerZone = false;
+              lastCar.forwardSpeed = 0;
+              lastCar.speedKmh = 0;
+              eliminationWave++;
+              eliminationTimerSec = 20.0;
+              audio.playLapComplete(false);
+
+              const remainingAfter = activeRacers.filter(
+                (c) => !c.eliminated
+              );
+              if (lastCar.isPlayer || remainingAfter.length <= 1) {
+                if (remainingAfter.length === 1 && remainingAfter[0].isPlayer) {
+                  player.finished = true;
+                  player.finishTimeMs = player.totalRaceTimeMs;
+                } else if (lastCar.isPlayer) {
+                  finishEarlyCallbackRef.current?.();
+                }
+              }
+            }
+          }
+        } else {
+          for (const c of cars) {
+            c.inDangerZone = false;
           }
         }
 
-        // Update Remote Online Players & AI Bots
+        // ==================== GAME MODE 2: CHECKPOINT / APEX GATE TIME ATTACK LOGIC ====================
+        if (activeMode === 'checkpoint' && !player.finished) {
+          player.timeBankSec = Math.max(0, player.timeBankSec - dt);
+          const gateNormT = ((player.nextGateIndex % 10) + 0.5) / 10;
+          const distT = Math.abs(player.trackProgressT - gateNormT);
+          if (distT < 0.032) {
+            player.gatesCleared++;
+            player.nextGateIndex = (player.nextGateIndex + 1) % 10;
+            const cleanApex =
+              player.surface === 'asphalt' && player.speedKmh >= 140;
+            if (cleanApex) {
+              player.apexCombo = Math.min(5, player.apexCombo + 1);
+              player.nitroAmount = Math.min(100, player.nitroAmount + 22);
+              player.currentLapTimeMs = Math.max(
+                500,
+                player.currentLapTimeMs - 200
+              );
+            } else {
+              player.apexCombo = 1;
+            }
+            const bonusSec = 4.2 + player.apexCombo * 0.25;
+            player.timeBankSec = Math.min(60, player.timeBankSec + bonusSec);
+            player.apexScore += Math.round(250 * player.apexCombo);
+            audio.playGearShift();
+          }
+
+          if (player.timeBankSec <= 0) {
+            finishEarlyCallbackRef.current?.();
+          }
+        }
+
+        // Update Remote Online Players & AI Bots (Skipped for AI in solo Checkpoint Time Attack)
         const baseDiffPace =
           botDifficultyRef.current === 'easy'
             ? 0.76
@@ -1990,6 +2209,9 @@ export default function App() {
 
         for (let i = 1; i < cars.length; i++) {
           const c = cars[i];
+          if (activeMode === 'checkpoint' && !c.isRemote) {
+            continue;
+          }
           if (c.isRemote) {
             const netState = remotePlayersRef.current.get(c.id);
             if (netState) {
@@ -2008,7 +2230,11 @@ export default function App() {
               c.nitroActive = netState.nitroActive;
               c.lap = netState.lap;
               c.totalDistanceDriven = netState.totalDistanceDriven;
-              c.unwrappedProgress = netState.totalDistanceDriven / 1200;
+              const rq = findClosestTrackSample(c.x, c.z, c.trackSampleIndex);
+              c.trackSampleIndex = rq.index;
+              c.trackProgressT = rq.t;
+              c.completedLaps = Math.max(0, (c.lap || 1) - 1);
+              c.unwrappedProgress = c.completedLaps + rq.t;
               c.finished = Boolean(netState.finished);
               if (netState.finishTimeMs !== undefined) {
                 c.finishTimeMs = netState.finishTimeMs;
@@ -2058,44 +2284,67 @@ export default function App() {
           }
         }
 
-        // Car-to-Car Soft Separation
-        for (let i = 0; i < cars.length; i++) {
-          for (let j = i + 1; j < cars.length; j++) {
-            const a = cars[i];
-            const b = cars[j];
-            const dx = b.x - a.x;
-            const dz = b.z - a.z;
-            const distSq = dx * dx + dz * dz;
-            const minSep = 2.6;
-            if (distSq > 0.0001 && distSq < minSep * minSep) {
-              const dist = Math.sqrt(distSq);
-              const overlap = (minSep - dist) * 0.5;
-              const nx = dx / dist;
-              const nz = dz / dist;
-              if (!a.isRemote) {
-                a.x -= nx * overlap;
-                a.z -= nz * overlap;
+        // Car-to-Car Soft Separation (Only between cars on the same vertical level & not in pit box)
+        if (activeMode !== 'checkpoint') {
+          for (let i = 0; i < cars.length; i++) {
+            for (let j = i + 1; j < cars.length; j++) {
+              const a = cars[i];
+              const b = cars[j];
+              if (
+                a.inPitBox ||
+                b.inPitBox ||
+                a.eliminated ||
+                b.eliminated ||
+                Math.abs((a.y ?? 0) - (b.y ?? 0)) > 2.2
+              ) {
+                continue;
               }
-              if (!b.isRemote) {
-                b.x += nx * overlap;
-                b.z += nz * overlap;
-              }
-              const rvx = b.vx - a.vx;
-              const rvz = b.vz - a.vz;
-              const vn = rvx * nx + rvz * nz;
-              if (vn < 0) {
-                const impulse = vn * 0.5;
+              const dx = b.x - a.x;
+              const dz = b.z - a.z;
+              const distSq = dx * dx + dz * dz;
+              const minSep = 2.6;
+              if (distSq > 0.0001 && distSq < minSep * minSep) {
+                const dist = Math.sqrt(distSq);
+                const overlap = (minSep - dist) * 0.5;
+                const nx = dx / dist;
+                const nz = dz / dist;
                 if (!a.isRemote) {
-                  a.vx += nx * impulse;
-                  a.vz += nz * impulse;
+                  a.x -= nx * overlap;
+                  a.z -= nz * overlap;
+                  if (!a.finished) {
+                    const qa = findClosestTrackSample(a.x, a.z, a.trackSampleIndex);
+                    a.trackSampleIndex = qa.index;
+                    a.trackProgressT = qa.t;
+                    a.unwrappedProgress = (a.completedLaps ?? 0) + qa.t;
+                  }
                 }
                 if (!b.isRemote) {
-                  b.vx -= nx * impulse;
-                  b.vz -= nz * impulse;
+                  b.x += nx * overlap;
+                  b.z += nz * overlap;
+                  if (!b.finished) {
+                    const qb = findClosestTrackSample(b.x, b.z, b.trackSampleIndex);
+                    b.trackSampleIndex = qb.index;
+                    b.trackProgressT = qb.t;
+                    b.unwrappedProgress = (b.completedLaps ?? 0) + qb.t;
+                  }
                 }
-                if (i === 0 && Math.abs(vn) > 3) {
-                  cameraTrauma = Math.min(1, cameraTrauma + 0.25);
-                  audio.playImpact(0.35);
+                const rvx = b.vx - a.vx;
+                const rvz = b.vz - a.vz;
+                const vn = rvx * nx + rvz * nz;
+                if (vn < 0) {
+                  const impulse = vn * 0.5;
+                  if (!a.isRemote) {
+                    a.vx += nx * impulse;
+                    a.vz += nz * impulse;
+                  }
+                  if (!b.isRemote) {
+                    b.vx -= nx * impulse;
+                    b.vz -= nz * impulse;
+                  }
+                  if (i === 0 && Math.abs(vn) > 3) {
+                    cameraTrauma = Math.min(1, cameraTrauma + 0.25);
+                    audio.playImpact(0.35);
+                  }
                 }
               }
             }
@@ -2137,7 +2386,10 @@ export default function App() {
           }
           if (now - lastHttpFallbackSyncTime > 300) {
             lastHttpFallbackSyncTime = now;
-            updateCloudPlayerTelemetry(activeRoomRef.current.roomId, payload as any).catch(() => {});
+            updateCloudPlayerTelemetry(
+              activeRoomRef.current.roomId,
+              payload as any
+            ).catch(() => {});
             fetch(`/api/lobbies/${activeRoomRef.current.roomId}/sync`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -2165,7 +2417,16 @@ export default function App() {
           const c = cars[i];
           const rig = carRigs[i];
           if (!rig) continue;
-          rig.root.position.set(c.x, c.y, c.z);
+          if (i === 0 && currentPhase === 'pitstop') {
+            // Lift the player's car on the front/rear jacks while in the pit stop
+            rig.root.position.set(
+              c.x,
+              c.y + 0.14 + Math.sin(now * 0.018) * 0.012,
+              c.z
+            );
+          } else {
+            rig.root.position.set(c.x, c.y, c.z);
+          }
           rig.root.rotation.y = c.heading;
           const slopePitch = c.trackSlopePitch ?? 0;
           rig.bodyTiltGroup.rotation.x = slopePitch - c.chassisPitch;
@@ -2183,7 +2444,7 @@ export default function App() {
           }
           const isBraking =
             i === 0
-              ? brake > 0.1 || handbrake
+              ? currentPhase === 'pitstop' || brake > 0.1 || handbrake
               : c.inPitBox || (c.aiPitStopTimer ?? 0) > 0;
           rig.brakeLightMat.color.setHex(isBraking ? 0xff4444 : 0x991b1b);
           rig.nitroFlameLeft.visible = c.nitroActive;
@@ -2191,6 +2452,7 @@ export default function App() {
         }
 
         const anyCarInPit =
+          currentPhase === 'pitstop' ||
           player.inPitBox ||
           player.inPitLaneAlley ||
           cars.some((c) => c.inPitBox || (c.aiPitStopTimer ?? 0) > 0);
@@ -2198,9 +2460,10 @@ export default function App() {
 
         // Tire smoke / rain spray particles
         if (
-          player.isDrifting ||
-          handbrake ||
-          (weatherRef.current === 'rain' && player.speedKmh > 90)
+          currentPhase === 'playing' &&
+          (player.isDrifting ||
+            handbrake ||
+            (weatherRef.current === 'rain' && player.speedKmh > 90))
         ) {
           const sinH = Math.sin(player.heading);
           const cosH = Math.cos(player.heading);
@@ -2219,93 +2482,166 @@ export default function App() {
 
         particles.update(dt);
 
-        audio.updateEngine(
-          player.rpm,
-          throttle,
-          player.isDrifting,
-          player.slipAngle,
-          player.nitroActive,
-          true,
-          player.gear,
-          player.surface === 'kerb' && player.speedKmh > 25
-        );
+        if (currentPhase === 'pitstop') {
+          // Spawn pneumatic Paoli wheel-gun titanium sparks at the 4 wheels while being serviced in the Pit Box!
+          if (Math.random() < 0.75) {
+            const wheelOffsets: Array<[number, number]> = [
+              [-0.95, 1.35],
+              [0.95, 1.35],
+              [-0.95, -1.32],
+              [0.95, -1.32],
+            ];
+            const [wx, wz] =
+              wheelOffsets[Math.floor(Math.random() * wheelOffsets.length)];
+            particles.spawn(
+              player.x + wx,
+              player.y + 0.36,
+              player.z + wz,
+              (Math.random() - 0.5) * 4.2,
+              0.8 + Math.random() * 2.2,
+              (Math.random() - 0.5) * 4.2,
+              Math.random() < 0.6 ? 0xfbbf24 : 0x38bdf8,
+              0.24,
+              0.22
+            );
+          }
 
-        // Zero-Jitter Car-Relative Camera Rig
-        const yawAlpha =
-          camMode === 'hood' ? 1.0 : 1 - Math.exp(-10.5 * dt);
-        smoothCamYaw = lerpAngle(smoothCamYaw, player.heading, yawAlpha);
-
-        const targetSpeedBack =
-          Math.min(0.85, (player.speedKmh / 300) * 0.65) +
-          (player.nitroActive ? 0.35 : 0);
-        smoothSpeedBackOffset +=
-          (targetSpeedBack - smoothSpeedBackOffset) * (1 - Math.exp(-8 * dt));
-
-        const targetLatOffset = -player.steerAngle * 0.85;
-        smoothLateralCamOffset +=
-          (targetLatOffset - smoothLateralCamOffset) * (1 - Math.exp(-9 * dt));
-
-        const sinCam = Math.sin(smoothCamYaw);
-        const cosCam = Math.cos(smoothCamYaw);
-        const rightX = cosCam;
-        const rightZ = -sinCam;
-
-        cameraTrauma = Math.max(0, cameraTrauma - 2.2 * dt);
-        const impactShake =
-          cameraTrauma > 0.01
-            ? Math.sin(now * 0.055) * cameraTrauma * cameraTrauma * 0.25
-            : 0;
-
-        if (camMode === 'chase') {
-          const dist = 6.8 + smoothSpeedBackOffset;
+          // Live 3D Pit Stop Broadcast Camera inside the Pit Lane framing the lifted car, 12 F1 Pit Crew mechanics, overhead carbon booms & Open-Bay Garages on the left/center of the viewport
+          const orbit = Math.sin(now * 0.0012) * 0.32;
+          camera.up.set(0, 1, 0);
           camera.position.set(
-            player.x - sinCam * dist + rightX * smoothLateralCamOffset,
-            player.y + 2.45 + Math.abs(impactShake),
-            player.z - cosCam * dist + rightZ * smoothLateralCamOffset
+            player.x + 2.35 + orbit * 0.18,
+            player.y + 1.82 + Math.cos(now * 0.0015) * 0.08,
+            player.z + 5.65 + orbit * 0.22
           );
+          // Offset lookAt slightly to the right (+x) so the 3D car & Pit Crew sit prominently in the left/center while the HUD panel occupies the right edge
           camera.lookAt(
-            player.x + Math.sin(player.heading) * 6.5,
-            player.y + 0.78,
-            player.z + Math.cos(player.heading) * 6.5
+            player.x + 0.85,
+            player.y + 0.52,
+            player.z + 0.45
           );
-        } else if (camMode === 'close') {
-          const dist = 4.8 + smoothSpeedBackOffset * 0.6;
-          camera.position.set(
-            player.x - sinCam * dist + rightX * (smoothLateralCamOffset * 0.7),
-            player.y + 1.68 + Math.abs(impactShake),
-            player.z - cosCam * dist + rightZ * (smoothLateralCamOffset * 0.7)
-          );
-          camera.lookAt(
-            player.x + Math.sin(player.heading) * 9.0,
-            player.y + 0.72,
-            player.z + Math.cos(player.heading) * 9.0
-          );
-        } else if (camMode === 'hood') {
-          // First-Person Open-Cockpit Formula View
-          const sinH = Math.sin(player.heading);
-          const cosH = Math.cos(player.heading);
-          const headSwayX = -player.steerAngle * 0.12;
-          camera.position.set(
-            player.x - sinH * 0.14 + cosH * headSwayX,
-            player.y + 0.94 + Math.abs(impactShake) * 0.3,
-            player.z - cosH * 0.14 - sinH * headSwayX
-          );
-          camera.lookAt(
-            player.x + sinH * 16.0,
-            player.y + 0.79 - player.chassisPitch * 2.8,
-            player.z + cosH * 16.0
-          );
+          audio.updateEngine(1850, 0.15, false, 0, false, false, 1, false);
         } else {
-          camera.position.set(
-            player.x - sinCam * 13.5,
-            player.y + 11.0,
-            player.z - cosCam * 13.5
+          audio.updateEngine(
+            player.rpm,
+            throttle,
+            player.isDrifting,
+            player.slipAngle,
+            player.nitroActive,
+            true,
+            player.gear,
+            player.surface === 'kerb' && player.speedKmh > 25
           );
-          camera.lookAt(
-            player.x + Math.sin(player.heading) * 5.5,
-            player.y + 0.5,
-            player.z + Math.cos(player.heading) * 5.5
-          );
+
+          // Zero-Jitter Car-Relative Camera Rig
+          const yawAlpha =
+            camMode === 'hood' ? 1.0 : 1 - Math.exp(-10.5 * dt);
+          smoothCamYaw = lerpAngle(smoothCamYaw, player.heading, yawAlpha);
+
+          const targetSpeedBack =
+            Math.min(0.85, (player.speedKmh / 300) * 0.65) +
+            (player.nitroActive ? 0.35 : 0);
+          smoothSpeedBackOffset +=
+            (targetSpeedBack - smoothSpeedBackOffset) * (1 - Math.exp(-8 * dt));
+
+          const targetLatOffset = -player.steerAngle * 0.85;
+          smoothLateralCamOffset +=
+            (targetLatOffset - smoothLateralCamOffset) *
+            (1 - Math.exp(-9 * dt));
+
+          const sinCam = Math.sin(smoothCamYaw);
+          const cosCam = Math.cos(smoothCamYaw);
+          const rightX = cosCam;
+          const rightZ = -sinCam;
+
+          cameraTrauma = Math.max(0, cameraTrauma - 2.2 * dt);
+          const impactShake =
+            cameraTrauma > 0.01
+              ? Math.sin(now * 0.055) * cameraTrauma * cameraTrauma * 0.25
+              : 0;
+
+          if (camMode === 'chase') {
+            camera.up.set(0, 1, 0);
+            const dist = 6.8 + smoothSpeedBackOffset;
+            camera.position.set(
+              player.x - sinCam * dist + rightX * smoothLateralCamOffset,
+              player.y + 2.45 + Math.abs(impactShake),
+              player.z - cosCam * dist + rightZ * smoothLateralCamOffset
+            );
+            camera.lookAt(
+              player.x + Math.sin(player.heading) * 6.5,
+              player.y + 0.78,
+              player.z + Math.cos(player.heading) * 6.5
+            );
+          } else if (camMode === 'close') {
+            camera.up.set(0, 1, 0);
+            const dist = 4.8 + smoothSpeedBackOffset * 0.6;
+            camera.position.set(
+              player.x -
+                sinCam * dist +
+                rightX * (smoothLateralCamOffset * 0.7),
+              player.y + 1.68 + Math.abs(impactShake),
+              player.z -
+                cosCam * dist +
+                rightZ * (smoothLateralCamOffset * 0.7)
+            );
+            camera.lookAt(
+              player.x + Math.sin(player.heading) * 9.0,
+              player.y + 0.72,
+              player.z + Math.cos(player.heading) * 9.0
+            );
+          } else if (camMode === 'hood') {
+            // F1 2026 First-Person Helmet / Cockpit View framing 3D Butterfly Steering Wheel OLED, Halo, Mirrors & Front Suspension
+            const sinH = Math.sin(player.heading);
+            const cosH = Math.cos(player.heading);
+            const speedRatio = Math.min(
+              1,
+              Math.abs(player.forwardSpeed) / 72
+            );
+            const kerbBuzz =
+              player.surface === 'kerb'
+                ? Math.sin(now * 0.095) * 0.013 * speedRatio
+                : player.surface === 'grass'
+                ? Math.sin(now * 0.065) * 0.02 * speedRatio
+                : 0;
+            const headSwayX =
+              -player.steerAngle * 0.095 + player.chassisRoll * 0.2;
+            const headPitchZ = -player.chassisPitch * 0.38;
+            const slopeY = (player.trackSlopePitch ?? 0) * 18.0;
+            camera.position.set(
+              player.x - sinH * (0.18 + headPitchZ) + cosH * headSwayX,
+              player.y + 0.905 + Math.abs(impactShake) * 0.24 + kerbBuzz,
+              player.z - cosH * (0.18 + headPitchZ) - sinH * headSwayX
+            );
+            // Subtle helmet roll into the corner apex
+            const helmetRoll =
+              player.steerAngle * 0.13 * (0.35 + speedRatio * 0.65) -
+              player.chassisRoll * 0.32;
+            camera.up.set(
+              cosH * Math.sin(helmetRoll),
+              Math.cos(helmetRoll),
+              -sinH * Math.sin(helmetRoll)
+            );
+            // Look into the corner apex while keeping the 3D steering wheel OLED & front tires in lower field of view
+            const lookHeading = player.heading + player.steerAngle * 0.3;
+            camera.lookAt(
+              player.x + Math.sin(lookHeading) * 18.0,
+              player.y + 0.64 - player.chassisPitch * 2.8 + slopeY + kerbBuzz * 0.5,
+              player.z + Math.cos(lookHeading) * 18.0
+            );
+          } else {
+            camera.up.set(0, 1, 0);
+            camera.position.set(
+              player.x - sinCam * 13.5,
+              player.y + 11.0,
+              player.z - cosCam * 13.5
+            );
+            camera.lookAt(
+              player.x + Math.sin(player.heading) * 5.5,
+              player.y + 0.5,
+              player.z + Math.cos(player.heading) * 5.5
+            );
+          }
         }
 
         weatherSystem.update(
@@ -2316,9 +2652,55 @@ export default function App() {
           weatherRef.current
         );
 
-        // Throttled HUD DOM updates (20Hz)
+        // Throttled HUD DOM & 3D Cockpit Steering Wheel OLED updates (20Hz)
         if (now - lastHudDomSyncTime >= 50) {
           lastHudDomSyncTime = now;
+
+          if (carRigs[0] && isCockpitView) {
+            updateCarRigCockpitTelemetry(
+              carRigs[0],
+              player.gear,
+              player.speedKmh,
+              player.rpm,
+              player.tireHealth,
+              player.nitroAmount,
+              player.tireCompound,
+              player.nitroActive
+            );
+          }
+
+          // Update Live Game Mode Banner in Top-Center
+          if (
+            modeBannerRef.current &&
+            modePrimaryTextRef.current &&
+            modeSubTextRef.current
+          ) {
+            if (activeMode === 'elimination') {
+              modeBannerRef.current.style.display = 'flex';
+              const standingsNow = computeRaceStandings(cars);
+              const activeRacers = standingsNow.filter(
+                (c) => !c.eliminated && !c.finished
+              );
+              const dangerCar = activeRacers[activeRacers.length - 1];
+              modePrimaryTextRef.current.textContent = `VYŘAZENÍ VLNA #${eliminationWave} ZA ${Math.max(
+                0,
+                eliminationTimerSec
+              )
+                .toFixed(1)
+                .replace('.', ',')} S`;
+              modeSubTextRef.current.textContent = dangerCar
+                ? `V OHROŽENÍ (ERS OVERCHARGE +85%): ${dangerCar.name.toUpperCase()}`
+                : 'POSLEDNÍ VŮZ NA TRATI VÍTĚZÍ';
+            } else if (activeMode === 'checkpoint') {
+              modeBannerRef.current.style.display = 'flex';
+              modePrimaryTextRef.current.textContent = `ČASOVÁ BANKA: ${player.timeBankSec
+                .toFixed(1)
+                .replace('.', ',')} S · BRÁNY: ${player.gatesCleared}`;
+              modeSubTextRef.current.textContent = `APEX KOMBO ${player.apexCombo}× · SKÓRE SEKTORŮ: ${player.apexScore} BODŮ`;
+            } else {
+              modeBannerRef.current.style.display = 'none';
+            }
+          }
 
           if (speedTextRef.current) {
             speedTextRef.current.textContent = Math.round(
@@ -2406,40 +2788,39 @@ export default function App() {
           if (pitZoneBannerRef.current) {
             if (player.inPitLaneAlley || player.inPitBox) {
               pitZoneBannerRef.current.className =
-                'px-2.5 py-1 bg-emerald-500 text-slate-950 border border-emerald-200 text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
+                'px-2 py-0.5 bg-emerald-500 text-slate-950 border border-emerald-200 text-[10px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
             } else if (pitRequestedRef.current || player.tireHealth < 55) {
               pitZoneBannerRef.current.className =
-                'px-2.5 py-1 bg-[#e10600] text-white border border-rose-300 text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
+                'px-2 py-0.5 bg-[#e10600] text-white border border-rose-300 text-[10px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl animate-pulse cursor-pointer';
             } else {
               pitZoneBannerRef.current.className =
-                'px-2.5 py-1 bg-black/90 hover:bg-zinc-900 border border-white/20 text-white text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl cursor-pointer';
+                'px-2 py-0.5 bg-black hover:bg-zinc-900 border border-white/25 text-white text-[10px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 cursor-pointer';
             }
           }
 
           if (pitStatusBannerRef.current && pitStatusTextRef.current) {
+            const nextTireInfo = TIRE_COMPOUNDS[nextPitCompoundRef.current];
             if (player.inPitLaneAlley && player.pitExitCooldown <= 0) {
               pitStatusBannerRef.current.style.display = 'flex';
               pitStatusBannerRef.current.style.borderColor = '#22c55e';
-              pitStatusTextRef.current.textContent =
-                '🟢 V ULIČCE V BOXECH (OMEZOVAČ 80 KM/H) — DOJED K MECHANIKŮM V BOXU NEBO STISKNI [B]';
+              pitStatusTextRef.current.textContent = `V ULIČCE V BOXECH (OMEZOVAČ 80 KM/H) — PŘIPRAVENA SMĚS ${nextTireInfo.name.toUpperCase()} [1-4]`;
               pitStatusTextRef.current.style.color = '#86efac';
             } else if (player.inPitZone && player.pitExitCooldown <= 0) {
               pitStatusBannerRef.current.style.display = 'flex';
               pitStatusBannerRef.current.style.borderColor = '#22c55e';
-              pitStatusTextRef.current.textContent =
-                '🟢 VJEZD DO BOXŮ VPRAVO (PIT IN) — ZATOČ VPRAVO ZA PIT WALL K 3D MECHANIKŮM!';
+              pitStatusTextRef.current.textContent = `VJEZD DO BOXŮ VPRAVO (PIT IN) — PŘIPRAVENA SMĚS ${nextTireInfo.name.toUpperCase()}`;
               pitStatusTextRef.current.style.color = '#86efac';
             } else if (pitRequestedRef.current) {
               pitStatusBannerRef.current.style.display = 'flex';
               pitStatusBannerRef.current.style.borderColor = '#f59e0b';
-              pitStatusTextRef.current.textContent = `📻 BOX V TOMTO KOLE POTVRZEN — ZAJED VPRAVO DO ULIČKY PIT IN ZA ${Math.round(
+              pitStatusTextRef.current.textContent = `BOX V TOMTO KOLE (${Math.round(
                 player.distanceToPitMeters
-              )} m`;
+              )} M) · PŘÍŠTÍ PNEU: ${nextTireInfo.name.toUpperCase()} (ZMĚŇ KLÁVESOU 1-4)`;
               pitStatusTextRef.current.style.color = '#fde68a';
             } else if (player.tireHealth < 45) {
               pitStatusBannerRef.current.style.display = 'flex';
               pitStatusBannerRef.current.style.borderColor = '#ef4444';
-              pitStatusTextRef.current.textContent = `⚠️ OPOTŘEBENÉ PNEU (${tireH}%) — ZAJED VPRAVO DO ULIČKY PIT IN NA CÍLOVÉ ROVINCE`;
+              pitStatusTextRef.current.textContent = `OPOTŘEBENÉ PNEU (${tireH}%) — STISKNI [B] PRO RÁDIO BOXU A ZVOL SMĚS [1-4]`;
               pitStatusTextRef.current.style.color = '#fca5a5';
             } else {
               pitStatusBannerRef.current.style.display = 'none';
@@ -2544,21 +2925,31 @@ export default function App() {
             const dotEl = rivalDotRefs.current[i]?.current;
             const labelEl = rivalLabelRefs.current[i]?.current;
             const rivalCar = cars[i + 1];
-            if (rivalCar) {
+            if (
+              rivalCar &&
+              !(activeMode === 'checkpoint' && !rivalCar.isRemote)
+            ) {
               const m = currentMinimapProjector.toMap(rivalCar.x, rivalCar.z);
               if (dotEl) {
                 dotEl.setAttribute('cx', m.mx.toFixed(1));
                 dotEl.setAttribute('cy', m.mz.toFixed(1));
-                dotEl.setAttribute('opacity', '1');
+                dotEl.setAttribute('opacity', rivalCar.eliminated ? '0.25' : '1');
                 dotEl.setAttribute(
                   'fill',
-                  rivalCar.isRemote ? '#22c55e' : '#f59e0b'
+                  rivalCar.eliminated
+                    ? '#64748b'
+                    : rivalCar.isRemote
+                    ? '#22c55e'
+                    : '#f59e0b'
                 );
               }
               if (labelEl) {
                 labelEl.setAttribute('x', (m.mx + 4.8).toFixed(1));
                 labelEl.setAttribute('y', (m.mz + 2.2).toFixed(1));
-                labelEl.setAttribute('opacity', '1');
+                labelEl.setAttribute(
+                  'opacity',
+                  rivalCar.eliminated ? '0.25' : '1'
+                );
                 labelEl.setAttribute(
                   'fill',
                   rivalCar.isRemote ? '#86efac' : '#fde68a'
@@ -2575,38 +2966,58 @@ export default function App() {
           }
         }
 
-        // Throttled React state sync (4Hz) for Live Leaderboard & Position
-        if (now - lastHudReactSyncTime > 250) {
+        // Throttled React state sync (10Hz) for Live Leaderboard & Position (Active during BOTH playing & pitstop!)
+        if (now - lastHudReactSyncTime > 100) {
           lastHudReactSyncTime = now;
-          const standings = computeRaceStandings(cars);
+          const visibleCars =
+            activeMode === 'checkpoint'
+              ? cars.filter((c) => c.isPlayer || c.isRemote)
+              : cars;
+          const standings = computeRaceStandings(visibleCars);
           const currentPos = standings.findIndex((c) => c.isPlayer) + 1;
           setPosition((prev) => (prev !== currentPos ? currentPos : prev));
           setLap((prev) => (prev !== player.lap ? player.lap : prev));
+          const leaderProgress = standings[0]?.unwrappedProgress ?? 0;
+          const trackLenMeters = Math.max(800, getTrackTotalLength());
           setLiveStandings(
-            standings.map((c) => ({
-              id: c.id,
-              name: c.name,
-              isPlayer: c.isPlayer,
-              isRemote: c.isRemote,
-              colorHex: c.spec.colorHex,
-              speedKmh: c.speedKmh,
-              lap: c.lap,
-              tireCompound: c.tireCompound,
-              tireHealth: c.tireHealth,
-              inPitBox: c.inPitBox,
-              inPitLaneAlley: c.inPitLaneAlley,
-              pitStopsCompleted: c.pitStopsCompleted,
-              aiStrategyName: c.aiStrategyName,
-              finished: c.finished,
-              finishTimeMs: c.finishTimeMs,
-            }))
+            standings.map((c, idx) => {
+              const distBehindMeters = Math.max(
+                0,
+                (leaderProgress - c.unwrappedProgress) * trackLenMeters
+              );
+              const refSpeedMs = Math.max(
+                38,
+                ((standings[0]?.speedKmh ?? 180) + c.speedKmh) * 0.5 / 3.6
+              );
+              const gapSec = idx === 0 ? 0 : distBehindMeters / refSpeedMs;
+              return {
+                id: c.id,
+                name: c.name,
+                isPlayer: c.isPlayer,
+                isRemote: c.isRemote,
+                colorHex: c.spec.colorHex,
+                speedKmh: c.speedKmh,
+                lap: c.lap,
+                tireCompound: c.tireCompound,
+                tireHealth: c.tireHealth,
+                inPitBox: c.inPitBox,
+                inPitLaneAlley: c.inPitLaneAlley,
+                pitStopsCompleted: c.pitStopsCompleted,
+                aiStrategyName: c.aiStrategyName,
+                eliminated: c.eliminated,
+                inDangerZone: c.inDangerZone,
+                finished: c.finished,
+                finishTimeMs: c.finishTimeMs,
+                gapToLeaderSec: gapSec,
+              };
+            })
           );
 
           if (player.finished) {
             const trackDef = resolveTrackDefinition(selectedTrackIdRef.current);
             setSummary({
               position: currentPos,
-              totalCars: cars.length,
+              totalCars: visibleCars.length,
               totalTimeMs: player.finishTimeMs ?? player.totalRaceTimeMs,
               bestLapMs: player.bestLapTimeMs,
               maxSpeedKmh: maxPlayerSpeedKmh,
@@ -2622,6 +3033,7 @@ export default function App() {
                 tireCompound: c.tireCompound,
                 pitStopsCompleted: c.pitStopsCompleted,
                 aiStrategyName: c.aiStrategyName,
+                eliminated: c.eliminated,
                 finished: c.finished,
                 finishTimeMs: c.finishTimeMs,
               })),
@@ -2640,36 +3052,6 @@ export default function App() {
             updatePhase('gameover');
           }
         }
-      } else if (currentPhase === 'pitstop') {
-        // Live 3D Pit Stop Broadcast Camera watching the 6 F1 Pit Crew mechanics service the car in the left-center viewport
-        updatePitCrewAnimation(currentTrackGroup, true, now * 0.001);
-        const sinH = Math.sin(player.heading);
-        const cosH = Math.cos(player.heading);
-        const rightX = cosH;
-        const rightZ = -sinH;
-        const orbit = Math.sin(now * 0.0015) * 0.45;
-        // Lift the car slightly on the front/rear jacks while in the pit stop
-        if (carRigs[0]) {
-          carRigs[0].root.position.set(
-            player.x,
-            player.y + 0.14 + Math.sin(now * 0.018) * 0.012,
-            player.z
-          );
-          carRigs[0].exteriorBodyMesh.visible = true;
-          carRigs[0].cockpitGroup.visible = false;
-        }
-        camera.position.set(
-          player.x + sinH * (4.2 + orbit * 0.25) - rightX * (3.6 + orbit * 0.15),
-          player.y + 2.05,
-          player.z + cosH * (4.2 + orbit * 0.25) - rightZ * (3.6 + orbit * 0.15)
-        );
-        // Aim slightly to the right of the car so the car + 6 Pit Crew mechanics appear in the left-center of the screen
-        camera.lookAt(
-          player.x + rightX * 1.35,
-          player.y + 0.35,
-          player.z + rightZ * 1.35
-        );
-        audio.updateEngine(1850, 0.15, false, 0, false, false, 1, false);
       } else {
         // Paused or Game Over
         updatePitCrewAnimation(currentTrackGroup, false, now * 0.001);
@@ -2713,10 +3095,14 @@ export default function App() {
         selectedTrackId={selectedTrackId}
         onSelectTrack={handleSelectTrack}
         onGenerateRandomTrack={handleGenerateRandomTrack}
+        gameMode={gameMode}
+        onSelectGameMode={handleSelectGameMode}
         selectedCarIdx={selectedCarIdx}
         onSelectCar={handleSelectCar}
         selectedCompound={selectedCompound}
         onSelectCompound={handleSelectCompound}
+        nextPitCompound={nextPitCompound}
+        onSelectNextPitCompound={handleSelectNextPitCompound}
         botCount={botCount}
         onChangeBotCount={handleChangeBotCount}
         botDifficulty={botDifficulty}

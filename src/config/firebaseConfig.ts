@@ -25,16 +25,13 @@ const safeFallback: FirebaseConfigShape = {
   messagingSenderId: '000000000000',
 };
 
-// Check if bundled config is present locally without hard-importing it
+declare const __LOCAL_FIREBASE_CONFIG__: Partial<FirebaseConfigShape> | null | undefined;
+
+// Check if local config was injected by vite.config.ts (works even when firebase-applet-config.json is in .gitignore)
 let fileConfig: Partial<FirebaseConfigShape> = {};
 try {
-  const modules = import.meta.glob('../../*.json', { eager: true });
-  const appletConfig = modules['../../firebase-applet-config.json'] as
-    | { default?: FirebaseConfigShape }
-    | FirebaseConfigShape
-    | undefined;
-  if (appletConfig) {
-    fileConfig = (appletConfig as any).default || appletConfig;
+  if (typeof __LOCAL_FIREBASE_CONFIG__ !== 'undefined' && __LOCAL_FIREBASE_CONFIG__) {
+    fileConfig = __LOCAL_FIREBASE_CONFIG__;
   }
 } catch {
   // Ignored in git - running on clean clone

@@ -12,6 +12,82 @@ export type BotDifficulty = 'easy' | 'medium' | 'hard';
 export type TimeOfDay = 'day' | 'sunrise' | 'sunset' | 'night';
 export type WeatherType = 'clear' | 'rain' | 'fog' | 'snow';
 export type TireCompound = 'soft' | 'medium' | 'hard' | 'wet';
+export type RaceGameMode = 'gp' | 'elimination' | 'checkpoint';
+
+export interface RaceGameModeInfo {
+  id: RaceGameMode;
+  name: string;
+  title: string;
+  shortTitle: string;
+  badge: string;
+  accentColor: string;
+  rules: string;
+  rulesSummary: string;
+  objective: string;
+  uniqueMechanics: string;
+  uniqueMechanic: string;
+  uniqueMechanicTitle: string;
+}
+
+export const RACE_GAME_MODES: Record<RaceGameMode, RaceGameModeInfo> = {
+  gp: {
+    id: 'gp',
+    name: 'Velká cena FIA (Grand Prix)',
+    title: 'Velká cena FIA (Grand Prix)',
+    shortTitle: 'Velká cena GP',
+    badge: 'ŠAMPIONÁT',
+    accentColor: '#e10600',
+    rules:
+      'Klasický závod s kompletním startovním roštem, degradací čtyř směsí pneumatik (S/M/H/W) a zastávkami v boxech v reálném čase.',
+    rulesSummary:
+      'Klasický závod na kola s degradací pneu (S/M/H/W) a živým Pit Stopem bez zastavení hry.',
+    objective:
+      'Dojet do cíle na 1. místě po absolvování předepsaného počtu kol se správně zvolenou strategií přezouvání.',
+    uniqueMechanics:
+      'Živý Pit Stop bez zastavení času hry + přepínání směsi na příští zastávku za jízdy přes inženýrské rádio [B].',
+    uniqueMechanic:
+      'Živý Pit Stop v reálném čase + předvolba pneu [B] + [1–4] za jízdy',
+    uniqueMechanicTitle: 'ŽIVÝ PIT STOP & STRATEGIE PNEU PIRELLI',
+  },
+  elimination: {
+    id: 'elimination',
+    name: 'Vyřazovačka (Knockout Sprint)',
+    title: 'Vyřazovačka (Knockout Sprint)',
+    shortTitle: 'Vyřazovačka',
+    badge: 'ELIMINACE 20S',
+    accentColor: '#f43f5e',
+    rules:
+      'Po úvodním 22s zahřívacím úseku se každých 20 sekund uzavře vyřazovací brána a vůz na posledním místě je okamžitě vyřazen.',
+    rulesSummary:
+      'Každých 20 sekund vypadává poslední vůz v pořadí. Poslední jezdec dostává nouzové přebití ERS.',
+    objective:
+      'Udržet se před eliminační hranicí v každé vlně a zůstat posledním přeživším pilotem na trati.',
+    uniqueMechanics:
+      'Zóna ohrožení (Danger Zone Overcharge): Poslední jezdec v pořadí získává +85 % rychlejší rekuperaci ERS a vyšší výkon DRS pro útok v posledních sekundách.',
+    uniqueMechanic:
+      'Danger Zone Overcharge (+85 % dobíjení ERS pro posledního jezdce)',
+    uniqueMechanicTitle: 'KAŽDÝCH 20 S VYPADÁVÁ POSLEDNÍ JEZDEC',
+  },
+  checkpoint: {
+    id: 'checkpoint',
+    name: 'Mistrovství Sektorů & Apexů',
+    title: 'Mistrovství Sektorů & Apexů (Time Attack)',
+    shortTitle: 'Apex Time Attack',
+    badge: 'APEX BRÁNY',
+    accentColor: '#22d3ee',
+    rules:
+      'Na okruhu je rozmístěno 10 kalibrovaných telemetrických bran. Začínáš s časovým bankem 45 s a každá projetá brána přidává +4,4 s.',
+    rulesSummary:
+      'Průjezd 3D telemetrickými branami proti odpočtu času s násobičem přesnosti Apex Kombo (1× až 5×).',
+    objective:
+      'Projet všechny sektorové brány před vypršením časomíry, udržet maximální násobič přesnosti a zajet rekordní čas kola.',
+    uniqueMechanics:
+      'Násobič přesnosti Apex Kombo (1× až 5×): Čistý průjezd branou na asfaltu nad 140 km/h zvyšuje kombo, dobíjí +22 % ERS a odečítá -0,20 s z času kola.',
+    uniqueMechanic:
+      'Apex Kombo (1× až 5×) — čistá stopa dobíjí ERS a odečítá čas kola',
+    uniqueMechanicTitle: '3D TELEMETRICKÉ BRÁNY & APEX KOMBO 1×–5×',
+  },
+};
 
 export interface TireCompoundInfo {
   id: TireCompound;
@@ -411,6 +487,8 @@ export interface CarState {
 
   trackSampleIndex: number;
   trackProgressT: number;
+  completedLaps?: number;
+  passedHalfway?: boolean;
   unwrappedProgress: number; // Continuous monotonic lap progress (0.0 -> 1.0 -> 2.0 -> 3.0)
   lap: number;
   maxCheckpointPassed: number;
@@ -421,6 +499,15 @@ export interface CarState {
   lastLapTimeMs: number | null;
   finished: boolean;
   finishTimeMs: number | null;
+
+  // Elimination & Checkpoint Time Attack Mode State
+  eliminated: boolean;
+  inDangerZone: boolean;
+  apexCombo: number;
+  apexScore: number;
+  gatesCleared: number;
+  timeBankSec: number;
+  nextGateIndex: number;
 
   lastImpactSeverity: number;
 }
@@ -501,11 +588,25 @@ export function createInitialCarState(
   const samples = getTrackSamples();
   const count = samples.length;
   const wrappedT = ((startT % 1) + 1) % 1;
-  const idx = Math.floor(wrappedT * count) % count;
-  const pt = samples[idx];
+  const exactFloatIdx = wrappedT * count;
+  const idx = Math.floor(exactFloatIdx) % count;
+  const nextIdx = (idx + 1) % count;
+  const frac = exactFloatIdx - Math.floor(exactFloatIdx);
+  const pt0 = samples[idx];
+  const pt1 = samples[nextIdx];
 
-  const x = pt.x + pt.nx * lateralGridOffset;
-  const z = pt.z + pt.nz * lateralGridOffset;
+  const cx = pt0.x + (pt1.x - pt0.x) * frac;
+  const cy = pt0.y + (pt1.y - pt0.y) * frac;
+  const cz = pt0.z + (pt1.z - pt0.z) * frac;
+  const nx = pt0.nx + (pt1.nx - pt0.nx) * frac;
+  const nz = pt0.nz + (pt1.nz - pt0.nz) * frac;
+  const nLen = Math.hypot(nx, nz) || 1;
+
+  const x = cx + (nx / nLen) * lateralGridOffset;
+  const z = cz + (nz / nLen) * lateralGridOffset;
+  const initQuery = findClosestTrackSample(x, z, idx);
+  const initialCompletedLaps = Math.round(startT - initQuery.t);
+  const initialUnwrapped = initialCompletedLaps + initQuery.t;
   const aiProfile =
     AI_STRATEGY_PROFILES[aiProfileIndex % AI_STRATEGY_PROFILES.length];
 
@@ -515,9 +616,9 @@ export function createInitialCarState(
     isPlayer,
     spec,
     x,
-    y: pt.y,
+    y: cy,
     z,
-    heading: pt.angle,
+    heading: pt0.angle,
     vx: 0,
     vz: 0,
     yawRate: 0,
@@ -562,18 +663,27 @@ export function createInitialCarState(
     currentDriftChain: 0,
     surface: 'asphalt',
     kerbRumble: 0,
-    trackSampleIndex: idx,
-    trackProgressT: pt.t,
-    unwrappedProgress: startT,
-    lap: 1,
+    trackSampleIndex: initQuery.index,
+    trackProgressT: initQuery.t,
+    completedLaps: initialCompletedLaps,
+    passedHalfway: startT >= 0 && initQuery.t >= 0.25,
+    unwrappedProgress: initialUnwrapped,
+    lap: Math.max(1, initialCompletedLaps + 1),
     maxCheckpointPassed: 0,
-    totalDistanceDriven: startT * getTrackTotalLength(),
+    totalDistanceDriven: initialUnwrapped * getTrackTotalLength(),
     currentLapTimeMs: 0,
     totalRaceTimeMs: 0,
     bestLapTimeMs: null,
     lastLapTimeMs: null,
     finished: false,
     finishTimeMs: null,
+    eliminated: false,
+    inDangerZone: false,
+    apexCombo: 1,
+    apexScore: 0,
+    gatesCleared: 0,
+    timeBankSec: 45.0,
+    nextGateIndex: 1,
     lastImpactSeverity: 0,
   };
 }
@@ -692,10 +802,12 @@ export function stepCarPhysics(
     !isReversing;
   state.nitroActive = canUseNitro;
   if (canUseNitro) {
-    driveForce += state.spec.enginePowerN * 0.55;
+    const dangerBoost = state.inDangerZone ? 0.68 : 0.55;
+    driveForce += state.spec.enginePowerN * dangerBoost;
     state.nitroAmount = Math.max(0, state.nitroAmount - 26 * dt);
   } else {
-    const rechargeRate = state.isDrifting ? 16 : 5.2;
+    const baseRecharge = state.isDrifting ? 16 : 5.2;
+    const rechargeRate = state.inDangerZone ? baseRecharge * 1.85 : baseRecharge;
     state.nitroAmount = Math.min(100, state.nitroAmount + rechargeRate * dt);
   }
 
@@ -864,7 +976,7 @@ export function stepCarPhysics(
 
   if (postQuery.barrierHit && postQuery.barrierPenetration > 0) {
     const sign = postQuery.barrierHit === 'right' ? 1 : -1;
-    const inPitAlleyLong = postQuery.t >= 0.89 || postQuery.t <= 0.11;
+    const inPitAlleyLong = postQuery.t >= 0.88 || postQuery.t <= 0.18;
     const rightLim = inPitAlleyLong
       ? trackDef.roadHalfWidth + 6.8
       : barrierHalfWidth;
@@ -1006,7 +1118,7 @@ export function stepCarPhysics(
 
   // Physical Pit Zone & Right-Side Drive-In Pit Lane Alley (Ulička v boxech) detection on Main Straight
   const trackTotalLen = getTrackTotalLength();
-  const inStraightCorridor = postQuery.t >= 0.895 || postQuery.t <= 0.085;
+  const inStraightCorridor = postQuery.t >= 0.89 || postQuery.t <= 0.16;
   state.inPitZone = inStraightCorridor;
 
   // Distance in meters along the track to the Pit Entry at t = 0.905
@@ -1042,8 +1154,8 @@ export function stepCarPhysics(
     }
   }
 
-  // Physical Drive-In Pit Box Stall inside the Pit Lane Alley (t >= 0.950 || t <= 0.050)
-  const inPitStallLongitudinal = postQuery.t >= 0.950 || postQuery.t <= 0.050;
+  // Physical Drive-In Pit Box Stall inside the Pit Lane Alley
+  const inPitStallLongitudinal = postQuery.t >= 0.950 || postQuery.t <= 0.115;
   state.inPitBox =
     state.pitExitCooldown <= 0 &&
     inPitStallLongitudinal &&
@@ -1093,8 +1205,14 @@ export function stepCarPhysics(
       inPitStallLongitudinal &&
       postQuery.lateralOffset >= trackDef.roadHalfWidth - 2.2
     ) {
-      // AI has physically driven into the Pit Lane Alley & reached its Pit Stall -> start 2.2s tire change!
-      state.aiPitStopTimer = 2.2;
+      // AI has physically driven into the Pit Lane Alley & reached its Pit Stall ->
+      // Simulate realistic 4-wheel gun + jack minigame duration (2.85s to 4.15s, matching player minigame speed!)
+      const idSeed = state.id
+        .split('')
+        .reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+      const simulatedMinigameDuration =
+        2.85 + ((idSeed + state.pitStopsCompleted * 3) % 6) * 0.24;
+      state.aiPitStopTimer = simulatedMinigameDuration;
       state.vx = 0;
       state.vz = 0;
       state.forwardSpeed = 0;
@@ -1148,43 +1266,65 @@ export function stepCarPhysics(
   if (deltaT < -0.5) deltaT += 1.0;
   if (deltaT > 0.5) deltaT -= 1.0;
 
-  // Guard against any non-physical spike (> 8% of track in a single frame)
-  if (Math.abs(deltaT) < 0.08 && !state.finished) {
-    const prevLapFloor = Math.floor(Math.max(0, state.unwrappedProgress));
-    state.unwrappedProgress += deltaT;
-    const newLapFloor = Math.floor(Math.max(0, state.unwrappedProgress));
+  if (state.completedLaps === undefined) {
+    state.completedLaps = Math.round(state.unwrappedProgress - prevT);
+  }
+  if (state.passedHalfway === undefined) {
+    state.passedHalfway = prevT >= 0.25 && prevT <= 0.85;
+  }
 
-    // Completed a full continuous lap forward across the Start/Finish Line
-    if (newLapFloor > prevLapFloor && state.unwrappedProgress >= 0.98) {
-      if (state.currentLapTimeMs > 8000) {
-        state.lastLapTimeMs = state.currentLapTimeMs;
-        if (
-          state.bestLapTimeMs === null ||
-          state.currentLapTimeMs < state.bestLapTimeMs
-        ) {
-          state.bestLapTimeMs = state.currentLapTimeMs;
+  if (newT >= 0.25 && newT <= 0.75) {
+    state.passedHalfway = true;
+  }
+
+  if (!state.finished) {
+    // Detect Start/Finish Line (t = 0) crossing
+    if (prevT > 0.70 && newT < 0.30 && deltaT > 0 && deltaT < 0.30) {
+      if (state.completedLaps < 0 || state.passedHalfway) {
+        state.completedLaps += 1;
+        if (state.completedLaps >= 1) {
+          state.passedHalfway = false;
+          if (state.currentLapTimeMs > 5000) {
+            state.lastLapTimeMs = state.currentLapTimeMs;
+            if (
+              state.bestLapTimeMs === null ||
+              state.currentLapTimeMs < state.bestLapTimeMs
+            ) {
+              state.bestLapTimeMs = state.currentLapTimeMs;
+            }
+            state.currentLapTimeMs = 0;
+          }
+
+          if (state.completedLaps >= totalLaps) {
+            // Exact sub-frame moment when the car crossed the finish line on the final lap
+            const nextUnwrapped = state.completedLaps + newT;
+            const overshoot = Math.max(0, nextUnwrapped - totalLaps);
+            const stepProgress = Math.max(0.0001, Math.abs(deltaT));
+            const subFrameFraction = Math.min(1, overshoot / stepProgress);
+            const exactFinishMs = Math.max(
+              100,
+              state.totalRaceTimeMs - subFrameFraction * stepMs
+            );
+            state.finished = true;
+            state.lap = totalLaps;
+            state.finishTimeMs = state.finishTimeMs ?? exactFinishMs;
+          } else {
+            state.lap = state.completedLaps + 1;
+          }
+        } else {
+          state.lap = Math.max(1, Math.min(totalLaps, state.completedLaps + 1));
         }
-        state.currentLapTimeMs = 0;
       }
-
-      if (newLapFloor >= totalLaps) {
-        // Exact sub-frame moment when the car crossed the finish line on the final lap
-        const overshoot = Math.max(0, state.unwrappedProgress - totalLaps);
-        const stepProgress = Math.max(0.0001, Math.abs(deltaT));
-        const subFrameFraction = Math.min(1, overshoot / stepProgress);
-        const exactFinishMs = Math.max(
-          100,
-          state.totalRaceTimeMs - subFrameFraction * stepMs
-        );
-        state.finished = true;
-        state.lap = totalLaps;
-        state.finishTimeMs = state.finishTimeMs ?? exactFinishMs;
-      } else {
-        state.lap = newLapFloor + 1;
-      }
+    } else if (prevT < 0.30 && newT > 0.70 && deltaT < 0 && deltaT > -0.30) {
+      state.completedLaps -= 1;
+      state.lap = Math.max(1, Math.min(totalLaps, state.completedLaps + 1));
     } else {
-      state.lap = Math.max(1, Math.min(totalLaps, newLapFloor + 1));
+      state.lap = Math.max(1, Math.min(totalLaps, state.completedLaps + 1));
     }
+
+    // Strict invariant: unwrappedProgress is ALWAYS completedLaps + newT so two cars on the same lap
+    // are 100% ordered by their exact continuous position newT along the circuit spline.
+    state.unwrappedProgress = state.completedLaps + newT;
   }
 
   state.trackProgressT = newT;
@@ -1216,7 +1356,7 @@ export function computeAiInput(
     }
   }
 
-  if ((aiState.aiPitStopTimer ?? 0) > 0) {
+  if ((aiState.aiPitStopTimer ?? 0) > 0 || aiState.eliminated) {
     return {
       throttle: 0,
       brake: 1,
@@ -1311,6 +1451,9 @@ export function computeAiInput(
  */
 export function computeRaceStandings(cars: CarState[]): CarState[] {
   return [...cars].sort((a, b) => {
+    if (Boolean(a.eliminated) !== Boolean(b.eliminated)) {
+      return a.eliminated ? 1 : -1;
+    }
     if (a.finished && b.finished) {
       return (a.finishTimeMs ?? Infinity) - (b.finishTimeMs ?? Infinity);
     }

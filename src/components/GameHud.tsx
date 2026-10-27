@@ -8,6 +8,8 @@ import {
   AI_STRATEGY_PROFILES,
   BotDifficulty,
   CAR_SPECS,
+  RACE_GAME_MODES,
+  RaceGameMode,
   TimeOfDay,
   TIRE_COMPOUNDS,
   TireCompound,
@@ -15,7 +17,13 @@ import {
   WeatherType,
 } from '../game/physics';
 import {
+  buildCustomTrackDefinition,
+  deleteCustomTrack,
+  encodeCustomTrackShareCode,
+  getCustomTracks,
   getTrackSamples,
+  PROCEDURAL_THEMES,
+  renameCustomTrack,
   resolveTrackDefinition,
   TRACK_DEFINITIONS,
 } from '../game/track';
@@ -92,8 +100,11 @@ export interface StandingEntry {
   inPitLaneAlley?: boolean;
   pitStopsCompleted?: number;
   aiStrategyName?: string;
+  eliminated?: boolean;
+  inDangerZone?: boolean;
   finished?: boolean;
   finishTimeMs?: number | null;
+  gapToLeaderSec?: number;
 }
 
 export interface HudLiveRefs {
@@ -118,6 +129,9 @@ export interface HudLiveRefs {
   pitZoneBanner: React.RefObject<HTMLButtonElement | null>;
   pitStatusBanner: React.RefObject<HTMLDivElement | null>;
   pitStatusText: React.RefObject<HTMLSpanElement | null>;
+  modeBanner?: React.RefObject<HTMLDivElement | null>;
+  modePrimaryText?: React.RefObject<HTMLSpanElement | null>;
+  modeSubText?: React.RefObject<HTMLSpanElement | null>;
   playerMapDot: React.RefObject<SVGCircleElement | null>;
   playerMapLabel: React.RefObject<SVGTextElement | null>;
   rivalMapDots: Array<React.RefObject<SVGCircleElement | null>>;
@@ -134,6 +148,9 @@ export interface RaceSummarySnapshot {
   pitStopsCompleted: number;
   carName: string;
   trackName: string;
+  gameMode?: RaceGameMode;
+  apexScore?: number;
+  gatesCleared?: number;
   standings: Array<{
     name: string;
     isPlayer: boolean;
@@ -142,6 +159,7 @@ export interface RaceSummarySnapshot {
     tireCompound?: TireCompound;
     pitStopsCompleted?: number;
     aiStrategyName?: string;
+    eliminated?: boolean;
     finished?: boolean;
     finishTimeMs?: number | null;
   }>;
@@ -149,6 +167,9 @@ export interface RaceSummarySnapshot {
 
 interface GameHudProps {
   phase: GamePhase;
+  gameMode?: RaceGameMode;
+  onChangeGameMode?: (mode: RaceGameMode) => void;
+  onSelectGameMode?: (mode: RaceGameMode) => void;
   selectedTrackId: string;
   onSelectTrack: (trackId: string) => void;
   onGenerateRandomTrack: () => void;
@@ -156,6 +177,8 @@ interface GameHudProps {
   onSelectCar: (idx: number) => void;
   selectedCompound: TireCompound;
   onSelectCompound: (compound: TireCompound) => void;
+  nextPitCompound?: TireCompound;
+  onSelectNextPitCompound?: (compound: TireCompound) => void;
   botCount: number;
   onChangeBotCount: (count: number) => void;
   botDifficulty: BotDifficulty;
@@ -316,6 +339,9 @@ const F1BroadcastLogo: React.FC<{ className?: string }> = ({
 
 export const GameHud: React.FC<GameHudProps> = ({
   phase,
+  gameMode = 'gp',
+  onChangeGameMode,
+  onSelectGameMode,
   selectedTrackId,
   onSelectTrack,
   onGenerateRandomTrack,
@@ -323,6 +349,8 @@ export const GameHud: React.FC<GameHudProps> = ({
   onSelectCar,
   selectedCompound,
   onSelectCompound,
+  nextPitCompound,
+  onSelectNextPitCompound,
   botCount,
   onChangeBotCount,
   botDifficulty,
@@ -375,16 +403,149 @@ export const GameHud: React.FC<GameHudProps> = ({
   hallOfFameLaps,
 }) => {
   const [titleTab, setTitleTab] = useState<
-    'single' | 'multiplayer' | 'hallOfFame'
+    'single' | 'editor' | 'multiplayer' | 'hallOfFame'
   >('single');
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
   const [customCreateCode, setCustomCreateCode] = useState<string>('');
   const [chatInput, setChatInput] = useState<string>('');
   const [copiedInvite, setCopiedInvite] = useState<boolean>(false);
 
+  // ==================== 2D-TO-3D TRACK EDITOR & CUSTOM TRACKS MANAGER STATE ====================
+  const [editorTrackId, setEditorTrackId] = useState<string>('custom-user-gp');
+  const [editorTrackName, setEditorTrackName] = useState<string>('Autodrom Brno 2026');
+  const [editorThemeIdx, setEditorThemeIdx] = useState<number>(0);
+  const [customTrackTick, setCustomTrackTick] = useState<number>(0);
+  const [renamingTrackId, setRenamingTrackId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState<string>('');
+  const [copiedTrackShareId, setCopiedTrackShareId] = useState<string | null>(null);
+  const [editorCheckpoints, setEditorCheckpoints] = useState<
+    Array<[number, number, number]>
+  >(() => {
+    try {
+      const saved = localStorage.getItem('apex_custom_track_pts_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length >= 3) return parsed;
+      }
+    } catch {
+      // Ignore
+    }
+    return [
+      [48, 3.0, 146],
+      [132, 6.5, 168],
+      [205, 3.5, 108],
+      [196, -1.5, -48],
+      [128, 3.0, -148],
+      [48, 0.5, -146],
+    ];
+  });
+  const [selectedCheckpointIdx, setSelectedCheckpointIdx] = useState<number>(1);
+  const [draggingCheckpointIdx, setDraggingCheckpointIdx] = useState<
+    number | null
+  >(null);
+  const editorSvgRef = useRef<SVGSVGElement | null>(null);
+
+  // Live preview of the custom track built from current 2D grid checkpoints
+  const editorPreviewTrack = useMemo(() => {
+    const def = buildCustomTrackDefinition(
+      'custom-editor-preview',
+      editorTrackName,
+      editorCheckpoints,
+      editorThemeIdx
+    );
+    const samples = getTrackSamples(def.id);
+    let len = 0;
+    let bridgeSamplesCount = 0;
+    for (let i = 1; i < samples.length; i++) {
+      len += Math.hypot(
+        samples[i].x - samples[i - 1].x,
+        samples[i].z - samples[i - 1].z
+      );
+      if (samples[i].isBridge) bridgeSamplesCount++;
+    }
+    return {
+      def,
+      samples,
+      lengthMeters: Math.round(len),
+      hasBridge: Boolean(def.hasBridge || bridgeSamplesCount > 0),
+    };
+  }, [editorTrackName, editorCheckpoints, editorThemeIdx]);
+
+  const handleApplyEditorTrackTo3D = (startImmediately = false, asNewTrack = false) => {
+    try {
+      localStorage.setItem(
+        'apex_custom_track_pts_v1',
+        JSON.stringify(editorCheckpoints)
+      );
+    } catch {
+      // Ignore
+    }
+    const targetId = asNewTrack
+      ? `custom-user-${Date.now().toString(36).slice(-5)}`
+      : editorTrackId || 'custom-user-gp';
+    setEditorTrackId(targetId);
+    const customDef = buildCustomTrackDefinition(
+      targetId,
+      editorTrackName,
+      editorCheckpoints,
+      editorThemeIdx
+    );
+    setCustomTrackTick((t) => t + 1);
+    onSelectTrack(customDef.id);
+    if (startImmediately) {
+      onStartRace();
+    }
+  };
+
+  const handleCopyTrackShareLink = (trkId: string) => {
+    const trk = resolveTrackDefinition(trkId);
+    const code = encodeCustomTrackShareCode(trk);
+    const url = `${window.location.origin}${window.location.pathname}?customTrack=${encodeURIComponent(code)}`;
+    navigator.clipboard?.writeText(url);
+    setCopiedTrackShareId(trkId);
+    window.setTimeout(() => setCopiedTrackShareId(null), 2600);
+  };
+
+  const handleLoadTrackIntoEditor = (trkId: string) => {
+    const trk = resolveTrackDefinition(trkId);
+    setEditorTrackId(trk.id.startsWith('custom-') ? trk.id : `custom-user-${Date.now().toString(36).slice(-4)}`);
+    setEditorTrackName(trk.id.startsWith('custom-') ? trk.name : `${trk.name} Vlastní`);
+    if (trk.rawUserCheckpoints && trk.rawUserCheckpoints.length >= 3) {
+      setEditorCheckpoints(trk.rawUserCheckpoints.map((pt) => [pt[0], pt[1], pt[2]]));
+    } else {
+      // Extract user-editable checkpoints (excluding the 3 pit-straight anchor points)
+      const extracted = trk.waypoints.slice(3).map((pt) => [pt[0], pt[1], pt[2]] as [number, number, number]);
+      if (extracted.length >= 3) {
+        setEditorCheckpoints(extracted);
+      }
+    }
+    setSelectedCheckpointIdx(0);
+    setTitleTab('editor');
+  };
+
+  // Exact 1:1 Coordinate conversion between 2D Editor SVG (360x240) and 3D World Space (X: -200..+260, Z: -190..+190)
+  // No artificial X>=26 clamping so Figure-8 bridges and full-map tracks match 1:1 what the player draws!
+  const worldToEditorSvg = (wx: number, wz: number) => ({
+    sx: ((wx + 200) / 460) * 360,
+    sz: ((190 - wz) / 380) * 240,
+  });
+
+  const editorSvgToWorld = (clientX: number, clientY: number) => {
+    const svg = editorSvgRef.current;
+    if (!svg) return { wx: 120, wz: 0 };
+    const rect = svg.getBoundingClientRect();
+    const u = Math.max(0.02, Math.min(0.98, (clientX - rect.left) / rect.width));
+    const v = Math.max(0.02, Math.min(0.98, (clientY - rect.top) / rect.height));
+    const wx = Math.round(u * 460 - 200);
+    const wz = Math.round(190 - v * 380);
+    return { wx, wz };
+  };
+
   // Pit Stop Minigame State
+  const effectiveNextCompound = nextPitCompound || selectedCompound;
   const [pitCompoundChoice, setPitCompoundChoice] =
-    useState<TireCompound>(selectedCompound);
+    useState<TireCompound>(effectiveNextCompound);
+  const [pitFrontWingAngle, setPitFrontWingAngle] = useState<number>(4);
   const [pitWheelIndex, setPitWheelIndex] = useState<number>(0);
   const [pitWheelResults, setPitWheelResults] = useState<
     Array<'perfect' | 'good' | 'slow'>
@@ -392,7 +553,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   const [pitNeedlePos, setPitNeedlePos] = useState<number>(50);
   const [pitTotalSeconds, setPitTotalSeconds] = useState<number>(0);
   const [pitLastFeedback, setPitLastFeedback] = useState<string>(
-    'Zastav ručičku v zelené zóně pro bleskové utažení matice!'
+    'Zastav ručičku v zelené zóně pro rychlé utažení matice — závod na trati stále běží!'
   );
   const pitAnimRef = useRef<number>(0);
   const pitNeedleValRef = useRef<number>(15);
@@ -401,13 +562,17 @@ export const GameHud: React.FC<GameHudProps> = ({
   useEffect(() => {
     if (phase === 'pitstop') {
       const defaultChoice =
-        weather === 'rain' || weather === 'snow' ? 'wet' : selectedCompound;
+        nextPitCompound
+          ? nextPitCompound
+          : weather === 'rain' || weather === 'snow'
+          ? 'wet'
+          : selectedCompound;
       setPitCompoundChoice(defaultChoice);
       setPitWheelIndex(0);
       setPitWheelResults([]);
       setPitTotalSeconds(0);
       setPitLastFeedback(
-        'Zvol směs pneu (S/M/H/W) a utáhni všechny 4 matice kol!'
+        'POZOR: Soupeři na trati nezastavují! Utáhni 4 kola co nejrychleji!'
       );
       pitNeedleValRef.current = 12;
       pitNeedleDirRef.current = 1;
@@ -432,7 +597,7 @@ export const GameHud: React.FC<GameHudProps> = ({
       pitAnimRef.current = requestAnimationFrame(stepNeedle);
       return () => cancelAnimationFrame(pitAnimRef.current);
     }
-  }, [phase, selectedCompound, weather]);
+  }, [phase, selectedCompound, nextPitCompound, weather]);
 
   const handleFastenWheel = () => {
     if (phase !== 'pitstop' || pitWheelIndex >= 4) return;
@@ -441,19 +606,19 @@ export const GameHud: React.FC<GameHudProps> = ({
     let wheelTime = 1.25;
     if (pos >= 38 && pos <= 66) {
       result = 'perfect';
-      wheelTime = 0.46;
+      wheelTime = 0.44;
       setPitLastFeedback(
-        `PERFEKTNÍ! ${WHEEL_NAMES[pitWheelIndex]} utaženo za 0.46 s (+ERS Boost)`
+        `PERFEKTNÍ! ${WHEEL_NAMES[pitWheelIndex]} utaženo za 0.44 s (+MGU-K Boost)`
       );
     } else if (pos >= 24 && pos <= 80) {
       result = 'good';
-      wheelTime = 0.76;
-      setPitLastFeedback(`DOBRÉ! ${WHEEL_NAMES[pitWheelIndex]} utaženo za 0.76 s`);
+      wheelTime = 0.74;
+      setPitLastFeedback(`DOBRÉ! ${WHEEL_NAMES[pitWheelIndex]} utaženo za 0.74 s`);
     } else {
       result = 'slow';
-      wheelTime = 1.32;
+      wheelTime = 1.28;
       setPitLastFeedback(
-        `ZASEKNUTÁ MATICE! ${WHEEL_NAMES[pitWheelIndex]} trvalo 1.32 s`
+        `ZASEKNUTÁ MATICE! ${WHEEL_NAMES[pitWheelIndex]} trvalo 1.28 s`
       );
     }
 
@@ -470,10 +635,16 @@ export const GameHud: React.FC<GameHudProps> = ({
     if (nextIdx >= 4) {
       onJackReleaseSound?.();
       const perfectCount = nextResults.filter((r) => r === 'perfect').length;
-      const nitroBonus = 32 + perfectCount * 17;
+      const nitroBonus = 34 + perfectCount * 17;
+      // Apply front wing aero tuning into steering sensitivity
+      const nextSens = Number((0.85 + pitFrontWingAngle * 0.06).toFixed(2));
+      onChangeTuning({
+        ...tuning,
+        steeringSensitivity: nextSens,
+      });
       window.setTimeout(() => {
         onCompletePitStop(pitCompoundChoice, nitroBonus);
-      }, 420);
+      }, 320);
     }
   };
 
@@ -485,12 +656,16 @@ export const GameHud: React.FC<GameHudProps> = ({
         handleFastenWheel();
       } else if (e.code === 'Digit1') {
         setPitCompoundChoice('soft');
+        onSelectNextPitCompound?.('soft');
       } else if (e.code === 'Digit2') {
         setPitCompoundChoice('medium');
+        onSelectNextPitCompound?.('medium');
       } else if (e.code === 'Digit3') {
         setPitCompoundChoice('hard');
+        onSelectNextPitCompound?.('hard');
       } else if (e.code === 'Digit4') {
         setPitCompoundChoice('wet');
+        onSelectNextPitCompound?.('wet');
       }
     };
     window.addEventListener('keydown', onKey);
@@ -499,16 +674,18 @@ export const GameHud: React.FC<GameHudProps> = ({
 
   const minimap = useMemo(
     () => computeMinimapData(selectedTrackId),
-    [selectedTrackId]
+    [selectedTrackId, customTrackTick]
   );
 
   const selectedTrack = useMemo(
     () => resolveTrackDefinition(selectedTrackId),
-    [selectedTrackId]
+    [selectedTrackId, customTrackTick]
   );
   const selectedCar = CAR_SPECS[selectedCarIdx] ?? CAR_SPECS[0];
   const currentCompoundInfo =
     TIRE_COMPOUNDS[selectedCompound] || TIRE_COMPOUNDS.soft;
+  const nextPitCompoundInfo =
+    TIRE_COMPOUNDS[effectiveNextCompound] || TIRE_COMPOUNDS.soft;
 
   const cameraLabel =
     cameraMode === 'chase'
@@ -516,7 +693,7 @@ export const GameHud: React.FC<GameHudProps> = ({
       : cameraMode === 'close'
       ? 'TV Pod'
       : cameraMode === 'hood'
-      ? 'Kokpit Halo'
+      ? 'Kokpit 2026'
       : 'Heli';
 
   const isHost = activeRoom ? activeRoom.hostId === localPlayerId : true;
@@ -540,16 +717,20 @@ export const GameHud: React.FC<GameHudProps> = ({
     return map;
   }, [hallOfFameLaps]);
 
+  const customTracksList = useMemo(() => {
+    return getCustomTracks().filter((t) => t.id !== 'custom-editor-preview');
+  }, [selectedTrackId, titleTab, customTrackTick]);
+
   return (
     <div className="pointer-events-none fixed inset-0 z-10 flex flex-col justify-between select-none overflow-hidden">
-      {/* ==================== SLEEK F1 25 PADDOCK HUB (TITLE SCREEN) ==================== */}
+      {/* ==================== OFFICIAL F1 2026 PADDOCK TELEMETRY HUB (TITLE SCREEN) ==================== */}
       {phase === 'title' && (
         <div className="pointer-events-auto relative flex-1 flex flex-col justify-between p-2 sm:p-4 md:p-5 overflow-y-auto">
-          {/* Top Official F1 Broadcast Header Bar */}
+          {/* Top Official F1 2026 Broadcast Header Bar */}
           <div
-            className="w-full max-w-[920px] mx-auto px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 border-b-2 border-[#e10600] shadow-2xl"
+            className="w-full max-w-[960px] mx-auto px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 border-b-2 border-[#e10600] shadow-2xl"
             style={{
-              backgroundColor: 'rgba(10, 12, 16, 0.94)',
+              backgroundColor: 'rgba(8, 10, 14, 0.95)',
               clipPath:
                 'polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%)',
             }}
@@ -559,27 +740,38 @@ export const GameHud: React.FC<GameHudProps> = ({
               <F1BroadcastLogo className="w-14 h-5 shrink-0" />
               <div className="h-5 w-0.5 bg-white/20" />
               <div>
-                <div className="text-[9px] font-bold tracking-[0.24em] uppercase text-[#e10600] leading-none">
-                  OFFICIAL RACING SIMULATOR
+                <div className="text-[9px] font-bold tracking-[0.22em] uppercase text-[#e10600] leading-none">
+                  FIA 2026 ACTIVE AERO CHAMPIONSHIP
                 </div>
                 <h1 className="font-display text-base sm:text-lg font-bold tracking-wider uppercase text-white leading-tight">
-                  APEX FORMULA 25
+                  APEX FORMULA 26
                 </h1>
               </div>
             </div>
 
             {/* Center Sleek Broadcast Navigation Tabs */}
-            <div className="flex items-center gap-1 bg-black/60 p-1 border border-white/10">
+            <div className="flex items-center gap-1 bg-black/75 p-1 border border-white/15">
               <button
                 type="button"
                 onClick={() => setTitleTab('single')}
-                className={`px-3.5 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer whitespace-nowrap ${
+                className={`px-3 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer whitespace-nowrap ${
                   titleTab === 'single'
                     ? 'bg-[#e10600] text-white shadow'
                     : 'text-slate-400 hover:text-white'
                 }`}
               >
-                Grand Prix
+                Velká cena
+              </button>
+              <button
+                type="button"
+                onClick={() => setTitleTab('editor')}
+                className={`px-3 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer whitespace-nowrap ${
+                  titleTab === 'editor'
+                    ? 'bg-[#e10600] text-white shadow'
+                    : 'text-cyan-300 hover:text-white'
+                }`}
+              >
+                Editor tratí 2D/3D
               </button>
               <button
                 type="button"
@@ -587,13 +779,13 @@ export const GameHud: React.FC<GameHudProps> = ({
                   setTitleTab('multiplayer');
                   onRefreshLobbies();
                 }}
-                className={`px-3.5 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+                className={`px-3 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
                   titleTab === 'multiplayer'
                     ? 'bg-[#e10600] text-white shadow'
                     : 'text-slate-300 hover:text-white'
                 }`}
               >
-                <span>Online</span>
+                <span>Online Paddock</span>
                 {activeRoom && (
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
                 )}
@@ -601,13 +793,13 @@ export const GameHud: React.FC<GameHudProps> = ({
               <button
                 type="button"
                 onClick={() => setTitleTab('hallOfFame')}
-                className={`px-3.5 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer whitespace-nowrap ${
+                className={`px-3 py-1.5 text-[11px] font-display font-bold uppercase tracking-wider transition cursor-pointer whitespace-nowrap ${
                   titleTab === 'hallOfFame'
                     ? 'bg-[#e10600] text-white shadow'
                     : 'text-amber-300 hover:text-white'
                 }`}
               >
-                🏆 Síň slávy
+                Síň slávy
               </button>
             </div>
 
@@ -671,71 +863,296 @@ export const GameHud: React.FC<GameHudProps> = ({
             </div>
           </div>
 
-          {/* Center Sleek F1 Paddock Content Panel */}
+          {/* Center Sleek F1 2026 Paddock Content Panel */}
           <div
-            className="w-full max-w-[920px] mx-auto my-auto p-3.5 sm:p-5 border border-white/15 shadow-2xl"
+            className="w-full max-w-[960px] mx-auto my-auto p-3.5 sm:p-5 border border-white/15 shadow-2xl"
             style={{
-              backgroundColor: 'rgba(10, 12, 16, 0.90)',
+              backgroundColor: 'rgba(8, 10, 14, 0.92)',
               borderLeft: '4px solid #e10600',
             }}
           >
             {titleTab === 'single' ? (
               <div className="space-y-3">
-                {/* Row 1: Circuit Selector + Procedural Generator + Track Environment */}
+                {/* Row 0: Championship Game Mode Selector (Classic GP + 2 New Modes) */}
+                <div className="bg-black/80 p-2.5 border border-white/15">
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                    <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#e10600]">
+                      HERNÍ REŽIM ŠAMPIONÁTU FIA 2026 (3 MÓDY)
+                    </span>
+                    <span className="text-[10px] font-mono-tabular text-cyan-300 font-bold">
+                      Unikátní mechanika: {RACE_GAME_MODES[gameMode].uniqueMechanic}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                    {(['gp', 'elimination', 'checkpoint'] as RaceGameMode[]).map((mId) => {
+                      const mInfo = RACE_GAME_MODES[mId];
+                      const active = gameMode === mId;
+                      return (
+                        <button
+                          key={mId}
+                          type="button"
+                          onClick={() => {
+                            onChangeGameMode?.(mId);
+                            onSelectGameMode?.(mId);
+                          }}
+                          className={`p-2 text-left border transition cursor-pointer relative ${
+                            active
+                              ? 'bg-white/15 border-[#e10600] text-white'
+                              : 'bg-black/70 border-white/10 text-slate-300 hover:border-white/30'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1">
+                            <span className="font-display font-bold text-xs uppercase tracking-wide">
+                              {mInfo.name}
+                            </span>
+                            <span
+                              className={`px-1.5 py-0.5 text-[8px] font-mono-tabular font-bold uppercase ${
+                                mId === 'elimination'
+                                  ? 'bg-rose-500/25 text-rose-300 border border-rose-500/40'
+                                  : mId === 'checkpoint'
+                                  ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40'
+                                  : 'bg-white/10 text-slate-200'
+                              }`}
+                            >
+                              {mInfo.badge}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-slate-300 mt-1 leading-snug">
+                            {mInfo.rulesSummary}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Row 1: 12 Official FIA Circuits + Separate Custom Tracks Category + Track Environment */}
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-3">
-                  <div className="lg:col-span-8">
-                    <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400 mb-1.5">
-                      <span>01. OKRUH FIA GRAND PRIX</span>
-                      <button
-                        type="button"
-                        onClick={onGenerateRandomTrack}
-                        disabled={Boolean(activeRoom && !isHost)}
-                        className="px-2.5 py-0.5 bg-white/10 hover:bg-white/20 border border-white/20 text-white font-bold text-[10px] uppercase tracking-wider transition cursor-pointer"
-                      >
-                        🎲 Generovat novou trať
-                      </button>
-                    </div>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                      {TRACK_DEFINITIONS.map((trk) => {
-                        const active = trk.id === selectedTrackId;
-                        const bestRec = fastestLapByTrack.get(trk.id);
-                        return (
+                  <div className="lg:col-span-8 space-y-2.5">
+                    <div>
+                      <div className="flex flex-wrap items-center justify-between gap-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300 mb-1.5">
+                        <span>
+                          OFICIÁLNÍ KALENDÁŘ FIA 2026 (12 TRATÍ · VČETNĚ 3D MOSTŮ VE TVARU 8)
+                        </span>
+                        <div className="flex items-center gap-1.5">
                           <button
-                            key={trk.id}
                             type="button"
-                            disabled={Boolean(activeRoom && !isHost)}
-                            onClick={() => onSelectTrack(trk.id)}
-                            className={`text-left p-2.5 border transition cursor-pointer relative overflow-hidden ${
-                              active
-                                ? 'bg-white/12 border-[#e10600] text-white'
-                                : 'bg-black/60 border-white/10 text-slate-300 hover:border-white/30'
-                            }`}
+                            onClick={() => setTitleTab('editor')}
+                            className="px-2.5 py-0.5 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 font-bold text-[10px] uppercase tracking-wider transition cursor-pointer"
                           >
-                            {active && (
-                              <span className="absolute top-0 left-0 right-0 h-0.5 bg-[#e10600]" />
-                            )}
-                            <div className="font-display font-bold text-xs uppercase tracking-wide truncate">
-                              {trk.name}
-                            </div>
-                            <div className="flex items-center justify-between text-[10px] text-slate-400 mt-1 font-mono-tabular">
-                              <span>
-                                Grip {Math.round(trk.gripFactor * 100)}%
-                              </span>
-                              <span className="text-emerald-400 font-bold">
-                                {bestRec
-                                  ? formatRaceTime(bestRec.lapTimeMs)
-                                  : 'F1'}
-                              </span>
-                            </div>
+                            Editor tratí 2D/3D
                           </button>
-                        );
-                      })}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onGenerateRandomTrack();
+                              setCustomTrackTick((t) => t + 1);
+                            }}
+                            disabled={Boolean(activeRoom && !isHost)}
+                            className="px-2.5 py-0.5 bg-white/10 hover:bg-white/20 border border-white/20 text-white font-bold text-[10px] uppercase tracking-wider transition cursor-pointer"
+                          >
+                            Generovat novou trať
+                          </button>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 max-h-[168px] overflow-y-auto pr-0.5">
+                        {TRACK_DEFINITIONS.map((trk) => {
+                          const active = trk.id === selectedTrackId;
+                          const bestRec = fastestLapByTrack.get(trk.id);
+                          return (
+                            <button
+                              key={trk.id}
+                              type="button"
+                              disabled={Boolean(activeRoom && !isHost)}
+                              onClick={() => onSelectTrack(trk.id)}
+                              className={`text-left p-2 border transition cursor-pointer relative overflow-hidden ${
+                                active
+                                  ? 'bg-white/15 border-[#e10600] text-white'
+                                  : 'bg-black/70 border-white/10 text-slate-300 hover:border-white/30'
+                              }`}
+                            >
+                              {active && (
+                                <span className="absolute top-0 left-0 right-0 h-0.5 bg-[#e10600]" />
+                              )}
+                              <div className="flex items-center justify-between gap-1">
+                                <span className="font-display font-bold text-[11px] uppercase tracking-wide truncate">
+                                  {trk.name}
+                                </span>
+                                {trk.hasBridge && (
+                                  <span className="px-1 py-0.2 bg-amber-500/25 border border-amber-400/50 text-amber-300 text-[8px] font-mono-tabular font-bold shrink-0">
+                                    MOST 8
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center justify-between text-[9px] text-slate-400 mt-1 font-mono-tabular">
+                                <span>
+                                  Grip {Math.round(trk.gripFactor * 100)}%
+                                </span>
+                                <span className="text-emerald-400 font-bold">
+                                  {bestRec
+                                    ? formatRaceTime(bestRec.lapTimeMs)
+                                    : 'FIA GP'}
+                                </span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Separate Category: Player-Created & Shared Custom Tracks (with Rename, Delete, Edit, Share Link) */}
+                    <div className="bg-black/80 p-2 border border-cyan-500/25">
+                      <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                        <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-cyan-300">
+                          MOJE VLASTNÍ & SDÍLENÉ 3D TRATĚ ({customTracksList.length})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditorTrackId(`custom-user-${Date.now().toString(36).slice(-4)}`);
+                            setEditorTrackName(`Vlastní GP #${customTracksList.length + 1}`);
+                            setTitleTab('editor');
+                          }}
+                          className="px-2 py-0.5 bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-200 text-[9px] font-bold uppercase cursor-pointer"
+                        >
+                          + Nakreslit novou vlastní trať
+                        </button>
+                      </div>
+
+                      {customTracksList.length === 0 ? (
+                        <div className="text-[11px] text-slate-400 py-1.5 flex items-center justify-between">
+                          <span>
+                            Zatím nemáš uloženou vlastní trať. Otevři 2D/3D Editor nebo vygeneruj procedurální okruh.
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-[112px] overflow-y-auto pr-0.5">
+                          {customTracksList.map((ct) => {
+                            const active = ct.id === selectedTrackId;
+                            const isRenaming = renamingTrackId === ct.id;
+                            return (
+                              <div
+                                key={ct.id}
+                                className={`p-2 border flex flex-col justify-between gap-1.5 ${
+                                  active
+                                    ? 'bg-cyan-950/40 border-cyan-400 text-white'
+                                    : 'bg-black/85 border-white/10 text-slate-200'
+                                }`}
+                              >
+                                {isRenaming ? (
+                                  <div className="flex items-center gap-1">
+                                    <input
+                                      type="text"
+                                      maxLength={28}
+                                      value={renameValue}
+                                      onChange={(e) => setRenameValue(e.target.value)}
+                                      className="flex-1 px-2 py-0.5 bg-black border border-cyan-400 text-xs font-bold text-white uppercase focus:outline-none"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        if (renameValue.trim()) {
+                                          renameCustomTrack(ct.id, renameValue.trim());
+                                          setCustomTrackTick((t) => t + 1);
+                                        }
+                                        setRenamingTrackId(null);
+                                      }}
+                                      className="px-2 py-0.5 bg-emerald-500 text-slate-950 text-[9px] font-bold uppercase cursor-pointer"
+                                    >
+                                      Uložit
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setRenamingTrackId(null)}
+                                      className="px-1.5 py-0.5 bg-white/10 text-slate-300 text-[9px] font-bold uppercase cursor-pointer"
+                                    >
+                                      Zrušit
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => onSelectTrack(ct.id)}
+                                      className="text-left flex items-center gap-1.5 truncate cursor-pointer flex-1"
+                                    >
+                                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0" />
+                                      <span className="font-display font-bold text-xs uppercase truncate">
+                                        {ct.name}
+                                      </span>
+                                      {ct.hasBridge && (
+                                        <span className="px-1 py-0.2 bg-amber-500/25 border border-amber-400/50 text-amber-300 text-[8px] font-mono-tabular font-bold shrink-0">
+                                          3D MOST
+                                        </span>
+                                      )}
+                                    </button>
+                                    <span className="text-[9px] font-mono-tabular text-cyan-300 shrink-0">
+                                      {active ? 'AKTIVNÍ' : 'VLASTNÍ'}
+                                    </span>
+                                  </div>
+                                )}
+
+                                <div className="flex flex-wrap items-center justify-between gap-1 pt-1 border-t border-white/10 text-[9px] font-bold uppercase">
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => onSelectTrack(ct.id)}
+                                      className="px-1.5 py-0.5 bg-white/10 hover:bg-white/20 text-white cursor-pointer"
+                                    >
+                                      Vybrat
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleLoadTrackIntoEditor(ct.id)}
+                                      className="px-1.5 py-0.5 bg-cyan-500/20 hover:bg-cyan-500/35 text-cyan-300 cursor-pointer"
+                                    >
+                                      Upravit
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setRenamingTrackId(ct.id);
+                                        setRenameValue(ct.name);
+                                      }}
+                                      className="px-1.5 py-0.5 bg-white/10 hover:bg-white/20 text-slate-200 cursor-pointer"
+                                    >
+                                      Přejmenovat
+                                    </button>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleCopyTrackShareLink(ct.id)}
+                                      className="px-1.5 py-0.5 bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/40 text-emerald-300 cursor-pointer"
+                                    >
+                                      {copiedTrackShareId === ct.id ? 'Odkaz zkopírován' : 'Sdílet odkazem'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        deleteCustomTrack(ct.id);
+                                        setCustomTrackTick((t) => t + 1);
+                                        if (selectedTrackId === ct.id) {
+                                          onSelectTrack(TRACK_DEFINITIONS[0].id);
+                                        }
+                                      }}
+                                      className="px-1.5 py-0.5 bg-rose-500/20 hover:bg-rose-500/40 text-rose-300 cursor-pointer"
+                                    >
+                                      Smazat
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   </div>
 
                   {/* Environment Conditions (Time of Day & Weather) */}
                   <div className="lg:col-span-4 grid grid-cols-2 lg:grid-cols-1 gap-2">
-                    <div className="bg-black/60 p-2 border border-white/10">
+                    <div className="bg-black/70 p-2 border border-white/10">
                       <div className="text-[9px] font-bold uppercase tracking-[0.16em] text-slate-400 mb-1">
                         DENNÍ DOBA
                       </div>
@@ -764,7 +1181,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       </div>
                     </div>
 
-                    <div className="bg-black/60 p-2 border border-white/10">
+                    <div className="bg-black/70 p-2 border border-white/10">
                       <div className="text-[9px] font-bold uppercase tracking-[0.16em] text-slate-400 mb-1">
                         POČASÍ NA TRATI
                       </div>
@@ -795,10 +1212,10 @@ export const GameHud: React.FC<GameHudProps> = ({
                   </div>
                 </div>
 
-                {/* Row 2: Formula 1 Team Selection (6 Constructors) */}
+                {/* Row 2: Formula 1 2026 Team Selection (6 Constructors) */}
                 <div>
-                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400 mb-1.5">
-                    <span>02. TOVÁRNÍ MONOPOST F1 (6 TÝMŮ)</span>
+                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300 mb-1.5">
+                    <span>TOVÁRNÍ MONOPOST F1 2026 (ACTIVE AERO & MGU-K)</span>
                     <span className="text-white font-mono-tabular">
                       {selectedCar.name} ·{' '}
                       <strong className="text-[#e10600]">
@@ -819,8 +1236,8 @@ export const GameHud: React.FC<GameHudProps> = ({
                           onClick={() => onSelectCar(idx)}
                           className={`text-left p-2.5 border transition cursor-pointer relative ${
                             active
-                              ? 'bg-white/12 border-white text-white'
-                              : 'bg-black/60 border-white/10 text-slate-300 hover:border-white/30'
+                              ? 'bg-white/15 border-white text-white'
+                              : 'bg-black/70 border-white/10 text-slate-300 hover:border-white/30'
                           }`}
                         >
                           <div className="flex items-center gap-1.5">
@@ -844,9 +1261,9 @@ export const GameHud: React.FC<GameHudProps> = ({
 
                 {/* Row 3: Pirelli Starting Tire Compound (S / M / H / W) + Race Format Strip */}
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-stretch">
-                  <div className="lg:col-span-8 bg-black/60 p-2.5 border border-white/10">
-                    <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400 mb-1.5">
-                      <span>03. STARTOVNÍ SMĚS PNEUMATIK PIRELLI</span>
+                  <div className="lg:col-span-8 bg-black/70 p-2.5 border border-white/10">
+                    <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.16em] text-slate-300 mb-1.5">
+                      <span>STARTOVNÍ SMĚS PNEUMATIK PIRELLI F1</span>
                       <span
                         style={{ color: currentCompoundInfo.cssColor }}
                         className="font-mono-tabular font-bold"
@@ -862,7 +1279,10 @@ export const GameHud: React.FC<GameHudProps> = ({
                           <button
                             key={cid}
                             type="button"
-                            onClick={() => onSelectCompound(cid)}
+                            onClick={() => {
+                              onSelectCompound(cid);
+                              onSelectNextPitCompound?.(cid);
+                            }}
                             className={`p-2 border text-left transition cursor-pointer ${
                               active
                                 ? 'bg-white/15 border-white text-white'
@@ -986,6 +1406,416 @@ export const GameHud: React.FC<GameHudProps> = ({
                   </div>
                 </div>
               </div>
+            ) : titleTab === 'editor' ? (
+              /* ==================== 2D GRID TO 3D TRACK EDITOR ("EDITOR TRATÍ 2D/3D") ==================== */
+              <div className="space-y-3">
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 items-stretch">
+                  {/* Left 7 Columns: Interactive 1:1 2D Checkpoint Grid Canvas */}
+                  <div className="lg:col-span-7 bg-black/85 border border-white/15 p-2.5 flex flex-col justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-cyan-400">
+                          2D CAD MŘÍŽKA OKRUHU 1:1 (KLIKNI PRO BOD · PŘEKŘÍŽENÍ TRATĚ VYTVOŘÍ 3D MOST)
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-[10px] font-mono-tabular text-slate-300">
+                        {editorPreviewTrack.hasBridge && (
+                          <span className="px-1.5 py-0.5 bg-amber-500/25 border border-amber-400/50 text-amber-300 font-bold">
+                            3D MOST AKTIVNÍ
+                          </span>
+                        )}
+                        <span>
+                          Délka: <strong className="text-white">{editorPreviewTrack.lengthMeters} m</strong> ·{' '}
+                          <strong className="text-emerald-400">{editorCheckpoints.length}</strong> CP
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="relative w-full aspect-[3/2] bg-[#070b12] border border-cyan-500/30 overflow-hidden">
+                      <svg
+                        ref={editorSvgRef}
+                        viewBox="0 0 360 240"
+                        className="w-full h-full cursor-crosshair touch-none select-none"
+                        onPointerDown={(e) => {
+                          if ((e.target as HTMLElement).dataset.cpIndex !== undefined) {
+                            return;
+                          }
+                          const { wx, wz } = editorSvgToWorld(e.clientX, e.clientY);
+                          const nextPts: Array<[number, number, number]> = [
+                            ...editorCheckpoints,
+                            [wx, 2.0, wz],
+                          ];
+                          setEditorCheckpoints(nextPts);
+                          setSelectedCheckpointIdx(nextPts.length - 1);
+                        }}
+                        onPointerMove={(e) => {
+                          if (draggingCheckpointIdx === null) return;
+                          const { wx, wz } = editorSvgToWorld(e.clientX, e.clientY);
+                          setEditorCheckpoints((prev) =>
+                            prev.map((pt, idx) =>
+                              idx === draggingCheckpointIdx
+                                ? [wx, pt[1], wz]
+                                : pt
+                            )
+                          );
+                        }}
+                        onPointerUp={() => setDraggingCheckpointIdx(null)}
+                        onPointerLeave={() => setDraggingCheckpointIdx(null)}
+                      >
+                        {/* 2D Telemetry Grid Lines */}
+                        {Array.from({ length: 12 }).map((_, gx) => (
+                          <line
+                            key={`vg-${gx}`}
+                            x1={gx * 30}
+                            y1={0}
+                            x2={gx * 30}
+                            y2={240}
+                            stroke="rgba(56, 189, 248, 0.08)"
+                            strokeWidth="1"
+                          />
+                        ))}
+                        {Array.from({ length: 8 }).map((_, gy) => (
+                          <line
+                            key={`hg-${gy}`}
+                            x1={0}
+                            y1={gy * 30}
+                            x2={360}
+                            y2={gy * 30}
+                            stroke="rgba(56, 189, 248, 0.08)"
+                            strokeWidth="1"
+                          />
+                        ))}
+
+                        {/* Pit Straight & Start/Finish Zone Highlight */}
+                        {(() => {
+                          const p0 = worldToEditorSvg(0, -68);
+                          const p1 = worldToEditorSvg(0, 82);
+                          return (
+                            <g>
+                              <line
+                                x1={p0.sx}
+                                y1={p0.sz}
+                                x2={p1.sx}
+                                y2={p1.sz}
+                                stroke="rgba(225, 6, 0, 0.35)"
+                                strokeWidth="14"
+                                strokeLinecap="round"
+                              />
+                              <text
+                                x={p1.sx + 6}
+                                y={(p0.sz + p1.sz) * 0.5}
+                                fill="#f87171"
+                                fontSize="7"
+                                fontWeight="bold"
+                              >
+                                START / PIT BOX
+                              </text>
+                            </g>
+                          );
+                        })()}
+
+                        {/* Live 3D Catmull-Rom Spline Road Ribbon Preview + Bridge Overpass Highlight */}
+                        {(() => {
+                          const polyPts = editorPreviewTrack.samples
+                            .map((s) => {
+                              const { sx, sz } = worldToEditorSvg(s.x, s.z);
+                              return `${sx.toFixed(1)},${sz.toFixed(1)}`;
+                            })
+                            .join(' ');
+                          const bridgePts = editorPreviewTrack.samples
+                            .filter((s) => s.isBridge || s.y > 4.2)
+                            .map((s) => {
+                              const { sx, sz } = worldToEditorSvg(s.x, s.z);
+                              return `${sx.toFixed(1)},${sz.toFixed(1)}`;
+                            })
+                            .join(' ');
+                          return (
+                            <>
+                              <polygon
+                                points={polyPts}
+                                fill="none"
+                                stroke="#1e293b"
+                                strokeWidth="10"
+                                strokeLinejoin="round"
+                              />
+                              <polygon
+                                points={polyPts}
+                                fill="none"
+                                stroke="#38bdf8"
+                                strokeWidth="3.2"
+                                strokeLinejoin="round"
+                              />
+                              {bridgePts.length > 0 && (
+                                <polyline
+                                  points={bridgePts}
+                                  fill="none"
+                                  stroke="#f59e0b"
+                                  strokeWidth="4.8"
+                                  strokeLinecap="round"
+                                />
+                              )}
+                            </>
+                          );
+                        })()}
+
+                        {/* User Checkpoints (Draggable Nodes) */}
+                        {editorCheckpoints.map((cp, idx) => {
+                          const { sx, sz } = worldToEditorSvg(cp[0], cp[2]);
+                          const isSel = idx === selectedCheckpointIdx;
+                          return (
+                            <g
+                              key={`cp-${idx}`}
+                              onPointerDown={(e) => {
+                                e.stopPropagation();
+                                setSelectedCheckpointIdx(idx);
+                                setDraggingCheckpointIdx(idx);
+                              }}
+                              className="cursor-grab active:cursor-grabbing"
+                            >
+                              <circle
+                                data-cp-index={idx}
+                                cx={sx}
+                                cy={sz}
+                                r={isSel ? 8.5 : 6.5}
+                                fill={isSel ? '#e10600' : '#0f172a'}
+                                stroke={isSel ? '#ffffff' : '#22d3ee'}
+                                strokeWidth="2"
+                              />
+                              <text
+                                x={sx}
+                                y={sz + 2.5}
+                                textAnchor="middle"
+                                fill="#ffffff"
+                                fontSize="7"
+                                fontWeight="bold"
+                                className="pointer-events-none"
+                              >
+                                {idx + 1}
+                              </text>
+                            </g>
+                          );
+                        })}
+                      </svg>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-1.5 mt-2 text-[10px] text-slate-400">
+                      <span>
+                        Kliknutím přidáš bod, tažením upravíš zatáčku. Pokud se trať překříží (tvar 8), automaticky vznikne 3D most s pilíři.
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (editorCheckpoints.length > 3) {
+                              const next = editorCheckpoints.slice(0, -1);
+                              setEditorCheckpoints(next);
+                              setSelectedCheckpointIdx(Math.max(0, next.length - 1));
+                            }
+                          }}
+                          className="px-2 py-0.5 bg-white/10 hover:bg-white/20 text-white font-bold uppercase cursor-pointer"
+                        >
+                          Odebrat poslední bod
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right 5 Columns: 3D Elevation, Theme, Presets, Share Link & Build 3D Track Action */}
+                  <div className="lg:col-span-5 flex flex-col justify-between gap-2.5 bg-black/75 border border-white/15 p-3">
+                    <div className="space-y-2.5">
+                      <div>
+                        <label className="block text-[9px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                          NÁZEV VLASTNÍ VELKÉ CENY
+                        </label>
+                        <input
+                          type="text"
+                          maxLength={28}
+                          value={editorTrackName}
+                          onChange={(e) => setEditorTrackName(e.target.value)}
+                          className="w-full px-2.5 py-1.5 bg-black border border-white/20 text-xs font-display font-bold text-white uppercase focus:outline-none focus:border-[#e10600]"
+                        />
+                      </div>
+
+                      {/* Selected Checkpoint 3D Elevation Slider */}
+                      {editorCheckpoints[selectedCheckpointIdx] && (
+                        <div className="bg-black/80 p-2.5 border border-white/10">
+                          <div className="flex items-center justify-between text-[10px] font-bold uppercase text-cyan-300 mb-1">
+                            <span>
+                              KONTROLNÍ BOD #{selectedCheckpointIdx + 1} — 3D VÝŠKA / MOST
+                            </span>
+                            <span className="font-mono-tabular text-white">
+                              {editorCheckpoints[selectedCheckpointIdx][1].toFixed(1)} m
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min="-4"
+                            max="12"
+                            step="0.5"
+                            value={editorCheckpoints[selectedCheckpointIdx][1]}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              setEditorCheckpoints((prev) =>
+                                prev.map((pt, i) =>
+                                  i === selectedCheckpointIdx
+                                    ? [pt[0], val, pt[2]]
+                                    : pt
+                                )
+                              );
+                            }}
+                            className="w-full accent-[#e10600] cursor-pointer"
+                          />
+                          <div className="flex items-center justify-between text-[9px] text-slate-400 mt-1">
+                            <span>Údolí (-4m)</span>
+                            <span>Rovina (0m)</span>
+                            <span>3D Most (+8 až +12m)</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Environment Theme Selector */}
+                      <div>
+                        <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                          VIZUÁLNÍ PROSTŘEDÍ 3D TRATĚ
+                        </div>
+                        <div className="grid grid-cols-3 gap-1">
+                          {PROCEDURAL_THEMES.slice(0, 3).map((th, idx) => (
+                            <button
+                              key={th.label}
+                              type="button"
+                              onClick={() => setEditorThemeIdx(idx)}
+                              className={`py-1.5 px-2 text-[10px] font-bold uppercase border cursor-pointer truncate ${
+                                editorThemeIdx === idx
+                                  ? 'bg-white text-slate-950 border-white'
+                                  : 'bg-black/70 text-slate-300 border-white/10 hover:text-white'
+                              }`}
+                            >
+                              {th.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Circuit Geometry Presets (Including Figure-8 Bridge Track!) */}
+                      <div>
+                        <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                          ŠABLONY TVARU TRATĚ (VČETNĚ TVARU 8 S MOSTEM)
+                        </div>
+                        <div className="grid grid-cols-2 gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditorTrackName('Suzuka Osmička 3D Most');
+                              setEditorCheckpoints([
+                                [45, 2.0, 152],
+                                [142, 4.0, 168],
+                                [215, 2.0, 102],
+                                [198, 0.0, 18],
+                                [95, 0.0, -15],
+                                [52, 0.0, -95],
+                                [128, 2.5, -162],
+                                [218, 4.5, -118],
+                                [192, 8.5, -18],
+                                [105, 8.5, 22],
+                                [48, 2.5, -125],
+                              ]);
+                              setSelectedCheckpointIdx(8);
+                            }}
+                            className="py-1.5 px-2 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-[10px] font-bold text-amber-200 uppercase cursor-pointer"
+                          >
+                            Tvar 8 (3D Most)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditorTrackName('Monza Hyperspeed GP');
+                              setEditorCheckpoints([
+                                [48, 2.0, 165],
+                                [165, 4.5, 175],
+                                [238, 1.0, 60],
+                                [232, -1.5, -95],
+                                [135, 2.0, -165],
+                              ]);
+                              setSelectedCheckpointIdx(0);
+                            }}
+                            className="py-1.5 px-2 bg-white/5 hover:bg-white/15 border border-white/10 text-[10px] font-bold text-slate-200 uppercase cursor-pointer"
+                          >
+                            Rychlý Ovál
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditorTrackName('Technický Sektor GP');
+                              setEditorCheckpoints([
+                                [42, 3.5, 145],
+                                [118, 7.0, 168],
+                                [182, 4.0, 96],
+                                [112, -2.0, 26],
+                                [215, 5.0, -42],
+                                [188, 3.0, -142],
+                                [78, 0.5, -154],
+                              ]);
+                              setSelectedCheckpointIdx(0);
+                            }}
+                            className="py-1.5 px-2 bg-white/5 hover:bg-white/15 border border-white/10 text-[10px] font-bold text-slate-200 uppercase cursor-pointer"
+                          >
+                            Technické S
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditorTrackName('Alpské Serpentiny');
+                              setEditorCheckpoints([
+                                [36, 4.5, 132],
+                                [95, 8.0, 175],
+                                [168, 2.0, 142],
+                                [235, 6.5, 68],
+                                [158, -3.0, -12],
+                                [224, 4.5, -96],
+                                [142, 2.0, -162],
+                                [54, 0.0, -145],
+                              ]);
+                              setSelectedCheckpointIdx(0);
+                            }}
+                            className="py-1.5 px-2 bg-white/5 hover:bg-white/15 border border-white/10 text-[10px] font-bold text-slate-200 uppercase cursor-pointer"
+                          >
+                            Horské vracečky
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5 pt-2 border-t border-white/10">
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleApplyEditorTrackTo3D(false, false)}
+                          className="py-2 bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-display text-[11px] font-bold uppercase tracking-wider cursor-pointer transition"
+                        >
+                          Uložit do mých tratí
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            handleApplyEditorTrackTo3D(false, false);
+                            handleCopyTrackShareLink(editorTrackId || 'custom-user-gp');
+                          }}
+                          className="py-2 bg-emerald-500/25 hover:bg-emerald-500/40 border border-emerald-400/50 text-emerald-200 font-display text-[11px] font-bold uppercase tracking-wider cursor-pointer transition"
+                        >
+                          {copiedTrackShareId ? 'Odkaz zkopírován!' : 'Sdílet trať odkazem'}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleApplyEditorTrackTo3D(true, false)}
+                        className="w-full py-2.5 bg-[#e10600] hover:bg-red-500 text-white font-display text-xs sm:text-sm font-bold uppercase tracking-wider cursor-pointer transition shadow-lg"
+                      >
+                        Uložit 3D trať a okamžitě závodit
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             ) : titleTab === 'multiplayer' ? (
               /* ==================== ONLINE MULTIPLAYER PADDOCK (REAL PLAYERS + AI BOT FILL + REAL-TIME TIRE SYNC) ==================== */
               <div className="space-y-3">
@@ -1022,14 +1852,14 @@ export const GameHud: React.FC<GameHudProps> = ({
                     }}
                     className="sm:col-span-5 py-2 px-3 bg-[#e10600] hover:bg-red-500 text-white font-display text-xs font-bold uppercase tracking-wider shadow-lg flex items-center justify-center gap-1.5 cursor-pointer"
                   >
-                    <span>⚡ Rychlý Online Zápas</span>
+                    <span>Rychlý Online Zápas</span>
                   </button>
                 </div>
 
                 {lobbyError && (
                   <div className="p-3 bg-zinc-950/95 border-l-4 border-amber-500 shadow-xl space-y-1.5">
                     <div className="flex items-center gap-1.5 text-xs font-bold uppercase text-amber-400">
-                      <span>⚠️ Upozornění online paddocku</span>
+                      <span>Upozornění online paddocku</span>
                     </div>
                     <div className="text-xs text-slate-200 leading-snug">
                       {lobbyError}
@@ -1137,7 +1967,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                         <div className="text-xs text-slate-400 py-2 text-center">
                           Žádná otevřená lobby. Klikni na{' '}
                           <span className="text-white font-bold">
-                            ⚡ Rychlý Online Zápas
+                            Rychlý Online Zápas
                           </span>{' '}
                           nebo vytvoř vlastní místnost!
                         </div>
@@ -1217,8 +2047,8 @@ export const GameHud: React.FC<GameHudProps> = ({
                           className="px-2.5 py-1 bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white cursor-pointer"
                         >
                           {copiedInvite
-                            ? '✓ Odkaz zkopírován!'
-                            : '🔗 Pozvat hráče'}
+                            ? 'Odkaz zkopírován'
+                            : 'Pozvat hráče odkazem'}
                         </button>
                         <button
                           type="button"
@@ -1329,7 +2159,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                             }
                             className="py-1.5 px-2 bg-white/5 hover:bg-white/10 disabled:opacity-60 border border-white/10 text-[11px] font-bold text-amber-300 cursor-pointer"
                           >
-                            🤖 Botů: {botCount} AI
+                            Počet botů: {botCount} AI
                           </button>
                           <button
                             type="button"
@@ -1468,7 +2298,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                                     P{activeRoom.players.length + bIdx + 1}
                                   </span>
                                   <span className="text-[11px] text-slate-300 font-semibold truncate">
-                                    🤖 AI Bot #{bIdx + 1}
+                                    AI Pilot #{bIdx + 1}
                                   </span>
                                   <span className="text-[9px] text-amber-400/90 truncate">
                                     ({aiProf.name})
@@ -1494,7 +2324,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       {/* Live Team Radio Chat */}
                       <div className="sm:col-span-5 bg-black/80 p-2 border border-white/10 flex flex-col justify-between">
                         <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400 mb-1">
-                          📻 Team Radio Chat
+                          Team Radio Chat
                         </div>
                         <div className="space-y-1 max-h-20 overflow-y-auto text-[11px] mb-1.5 pr-1">
                           {(activeRoom.chatMessages &&
@@ -1610,7 +2440,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   {/* Fastest Laps per Circuit */}
                   <div className="bg-black/70 p-3 border border-white/10">
                     <div className="text-[10px] font-bold uppercase tracking-wider text-purple-400 mb-2 flex items-center justify-between">
-                      <span>⏱️ Nejrychlejší kola na tratích</span>
+                      <span>Nejrychlejší kola na tratích</span>
                       <span className="text-slate-400">Rekord okruhu</span>
                     </div>
                     <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
@@ -1668,7 +2498,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   {/* Most Races Won */}
                   <div className="bg-black/70 p-3 border border-white/10">
                     <div className="text-[10px] font-bold uppercase tracking-wider text-amber-400 mb-2 flex items-center justify-between">
-                      <span>🏆 Síň slávy — Nejvíce vítězství</span>
+                      <span>Síň slávy — Nejvíce vítězství</span>
                       <span className="text-slate-400">Výhry · Pódia</span>
                     </div>
                     {hallOfFameDrivers.length === 0 ? (
@@ -1703,7 +2533,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                             </div>
                             <div className="text-right shrink-0">
                               <div className="font-mono-tabular text-xs font-bold text-emerald-400">
-                                {drv.wins} 🏆
+                                {drv.wins} VÝHER
                               </div>
                             </div>
                           </div>
@@ -1730,14 +2560,18 @@ export const GameHud: React.FC<GameHudProps> = ({
               }}
             >
               {activeRoom
-                ? `🏁 Odstartovat Online Grand Prix (${activeRoom.players.length} Hráčů + ${botCount} AI)`
-                : `🏁 Odstartovat Velkou Cenu (${botCount + 1} formulí na roštu)`}
+                ? `ODSTARTOVAT ONLINE ${RACE_GAME_MODES[gameMode].shortTitle} (${activeRoom.players.length} HRÁČŮ + ${botCount} AI)`
+                : `ODSTARTOVAT ${RACE_GAME_MODES[gameMode].title} (${
+                    gameMode === 'checkpoint'
+                      ? 'SÓLO ČASOVKA + BRÁNY'
+                      : `${botCount + 1} FORMULÍ NA ROŠTU`
+                  })`}
             </button>
           </div>
 
           {/* Flat Bottom Control Hint */}
           <div className="text-center text-[11px] sm:text-xs font-semibold tracking-wide text-slate-200/90 drop-shadow py-1">
-            WASD / Šipky Řízení · Zajeď vpravo na cílové rovince do uličky PIT IN pro výměnu pneu (S/M/H/W) · Shift DRS · C Kamera
+            WASD / Šipky Řízení · Klávesa [B] Rádio Boxu + [1–4] Volba Pneu Příštího Pit Stopu za Jízdy · Shift DRS · C Kamera
           </div>
         </div>
       )}
@@ -1745,39 +2579,45 @@ export const GameHud: React.FC<GameHudProps> = ({
       {/* ==================== PLAYING HUD (OFFICIAL F1 24/25 TV BROADCAST & HALO TELEMETRY) ==================== */}
       {(phase === 'playing' || phase === 'pitstop' || phase === 'paused') && (
         <>
-          {/* ==================== TOP PERIMETER: F1 BROADCAST TIMING TOWER (LEFT) + SECTOR & DELTA BOX (RIGHT) ==================== */}
+          {/* ==================== TOP PERIMETER: F1 BROADCAST TIMING TOWER (LEFT) + MODE / PIT BANNER (CENTER) + SECTOR & DELTA BOX (RIGHT) ==================== */}
           <div className="flex items-start justify-between p-2 sm:p-4 gap-2">
-            {/* TOP-LEFT: Official F1 TV Broadcast Timing Tower (Exact match to reference image.png) */}
+            {/* TOP-LEFT: Official F1 TV Broadcast Timing Tower */}
             <div
               className="pointer-events-auto w-48 sm:w-64 shadow-2xl overflow-hidden"
               style={{
-                backgroundColor: 'rgba(10, 12, 16, 0.88)',
+                backgroundColor: 'rgba(10, 12, 16, 0.90)',
                 clipPath:
                   'polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%)',
                 borderBottom: '2px solid rgba(255,255,255,0.12)',
               }}
             >
-              {/* F1 Logo + GRAND PRIX Header */}
+              {/* F1 Logo + GRAND PRIX / MODE Header */}
               <div className="px-3 pt-2.5 pb-1.5 flex items-center justify-between border-b border-white/10">
                 <F1BroadcastLogo className="w-14 sm:w-16 h-5" />
                 <div className="text-right leading-none">
-                  <div className="font-display text-[11px] sm:text-xs font-bold tracking-[0.18em] uppercase text-slate-200">
-                    {activeRoom ? 'ONLINE' : 'GRAND'}
+                  <div className="font-display text-[10px] sm:text-[11px] font-bold tracking-[0.18em] uppercase text-slate-300">
+                    {activeRoom ? `ONLINE #${activeRoom.roomId}` : 'FIA MÓD'}
                   </div>
-                  <div className="font-display text-xs sm:text-sm font-bold tracking-[0.2em] uppercase text-white">
-                    {activeRoom ? `#${activeRoom.roomId}` : 'PRIX'}
+                  <div
+                    className="font-display text-xs sm:text-sm font-bold tracking-[0.18em] uppercase"
+                    style={{ color: RACE_GAME_MODES[gameMode].accentColor }}
+                  >
+                    {RACE_GAME_MODES[gameMode].shortTitle}
                   </div>
                 </div>
               </div>
 
-              {/* Lap Subheader (VUELTA / KOLO style with bottom rule) */}
-              <div className="px-3 py-1.5 text-center border-b border-white/25 bg-white/[0.03]">
-                <span className="font-display text-xs sm:text-sm font-bold tracking-[0.22em] uppercase text-white font-mono-tabular">
+              {/* Lap & Live Player Position Subheader */}
+              <div className="px-3 py-1.5 flex items-center justify-between border-b border-white/25 bg-white/[0.04]">
+                <span className="font-display text-xs sm:text-sm font-bold tracking-[0.18em] uppercase text-white font-mono-tabular">
                   KOLO {lap}
                   <span className="text-slate-400 font-normal">
                     {' '}
                     / {totalLaps}
                   </span>
+                </span>
+                <span className="px-1.5 py-0.5 bg-[#e10600] text-white font-display text-[11px] sm:text-xs font-bold tracking-wider uppercase font-mono-tabular">
+                  POZICE {position}/{totalCarsCount}
                 </span>
               </div>
 
@@ -1796,7 +2636,11 @@ export const GameHud: React.FC<GameHudProps> = ({
                     <div
                       key={driver.id}
                       className={`flex items-center justify-between px-2.5 py-1 text-[11px] sm:text-xs font-mono-tabular ${
-                        driver.isPlayer
+                        driver.eliminated
+                          ? 'bg-rose-950/40 text-slate-500 line-through'
+                          : driver.inDangerZone
+                          ? 'bg-amber-500/20 text-amber-200 font-bold'
+                          : driver.isPlayer
                           ? 'bg-white/15 text-white font-bold'
                           : 'text-slate-100'
                       }`}
@@ -1815,13 +2659,21 @@ export const GameHud: React.FC<GameHudProps> = ({
                       </div>
 
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {driver.finished ? (
+                        {driver.eliminated ? (
+                          <span className="px-1 py-0.2 bg-rose-600 text-white text-[8px] font-bold tracking-wider uppercase">
+                            OUT
+                          </span>
+                        ) : driver.finished ? (
                           <span className="px-1 py-0.2 bg-emerald-500 text-slate-950 text-[8px] font-bold tracking-wider uppercase">
-                            🏁 CÍL
+                            CÍL
                           </span>
                         ) : inPit ? (
                           <span className="px-1 py-0.2 bg-[#e10600] text-white text-[8px] font-bold tracking-wider uppercase animate-pulse">
                             PIT
+                          </span>
+                        ) : driver.inDangerZone ? (
+                          <span className="px-1 py-0.2 bg-amber-500 text-slate-950 text-[8px] font-bold tracking-wider uppercase animate-pulse">
+                            OHROŽEN
                           </span>
                         ) : null}
                         {/* Official Pirelli Circular Compound Ring */}
@@ -1835,11 +2687,13 @@ export const GameHud: React.FC<GameHudProps> = ({
                           {comp.shortCode}
                         </span>
                         <span className="w-12 sm:w-14 text-right text-[10px] sm:text-[11px] text-slate-200">
-                          {driver.finished &&
-                          idx > 0 &&
-                          leaderFinishMs !== null &&
-                          driver.finishTimeMs !== null &&
-                          driver.finishTimeMs !== undefined
+                          {driver.eliminated
+                            ? 'VYŘAZEN'
+                            : driver.finished &&
+                              idx > 0 &&
+                              leaderFinishMs !== null &&
+                              driver.finishTimeMs !== null &&
+                              driver.finishTimeMs !== undefined
                             ? `+${Math.max(
                                 0,
                                 (driver.finishTimeMs - leaderFinishMs) / 1000
@@ -1849,8 +2703,13 @@ export const GameHud: React.FC<GameHudProps> = ({
                             : driver.finished && idx === 0
                             ? 'VÍTĚZ'
                             : idx === 0
-                            ? `${Math.round(driver.speedKmh)} km/h`
-                            : `+${(idx * 0.65 + 0.32).toFixed(3).replace('.', ',')}`}
+                            ? 'LÍDR'
+                            : `+${Math.max(
+                                0.01,
+                                driver.gapToLeaderSec ?? idx * 0.42
+                              )
+                                .toFixed(3)
+                                .replace('.', ',')}s`}
                         </span>
                       </div>
                     </div>
@@ -1859,20 +2718,43 @@ export const GameHud: React.FC<GameHudProps> = ({
               </div>
             </div>
 
-            {/* TOP-CENTER: Dynamic Pit Lane / Team Radio Alert Banner */}
-            <div
-              ref={liveRefs.pitStatusBanner}
-              className="pointer-events-auto hidden items-center gap-2 px-4 py-2 border-l-4 border-emerald-400 bg-black/90 text-white shadow-2xl mx-auto mt-1"
-            >
-              <span
-                ref={liveRefs.pitStatusText}
-                className="font-display text-xs sm:text-sm font-bold tracking-wider uppercase text-emerald-300"
+            {/* TOP-CENTER: Game Mode Live Telemetry Banner + Pit Lane / Team Radio Alert Banner */}
+            <div className="flex flex-col items-center gap-1.5 mx-auto mt-0.5">
+              <div
+                ref={liveRefs.modeBanner}
+                className={`pointer-events-auto ${
+                  gameMode === 'gp' ? 'hidden' : 'flex'
+                } flex-col items-center px-4 py-1.5 border-t-2 bg-black/90 text-white shadow-2xl min-w-[230px] sm:min-w-[300px]`}
+                style={{ borderColor: RACE_GAME_MODES[gameMode].accentColor }}
               >
-                🟢 PIT LANE OTEVŘENA — ZAJED VPRAVO DO BOXU
-              </span>
+                <span
+                  ref={liveRefs.modePrimaryText}
+                  className="font-display text-xs sm:text-sm font-bold tracking-wider uppercase text-white font-mono-tabular"
+                >
+                  {RACE_GAME_MODES[gameMode].title}
+                </span>
+                <span
+                  ref={liveRefs.modeSubText}
+                  className="text-[10px] font-mono-tabular font-semibold text-slate-300"
+                >
+                  {RACE_GAME_MODES[gameMode].uniqueMechanicTitle}
+                </span>
+              </div>
+
+              <div
+                ref={liveRefs.pitStatusBanner}
+                className="pointer-events-auto hidden items-center gap-2 px-4 py-1.5 border-l-4 border-emerald-400 bg-black/90 text-white shadow-2xl"
+              >
+                <span
+                  ref={liveRefs.pitStatusText}
+                  className="font-display text-xs sm:text-sm font-bold tracking-wider uppercase text-emerald-300"
+                >
+                  PIT LANE OTEVŘENA — ZAJED VPRAVO DO BOXU
+                </span>
+              </div>
             </div>
 
-            {/* TOP-RIGHT: Official F1 Sector Strip + Lap Time + Diagonal-Striped DELTA Box (Exact match to image.png) */}
+            {/* TOP-RIGHT: Official F1 Sector Strip + Lap Time + Diagonal-Striped DELTA Box */}
             <div className="flex flex-col items-end gap-1.5">
               <div
                 className="pointer-events-auto w-48 sm:w-64 shadow-2xl overflow-hidden border border-white/10"
@@ -1949,7 +2831,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   }}
                   className="px-2.5 py-1 bg-black/85 hover:bg-white/15 border border-white/15 text-[11px] font-display font-bold uppercase tracking-wider text-white flex items-center gap-1 cursor-pointer whitespace-nowrap"
                 >
-                  <span>🎥 {cameraLabel}</span>
+                  <span>KAMERA: {cameraLabel}</span>
                   <span className="text-[9px] text-slate-400 font-mono-tabular hidden sm:inline">
                     [C]
                   </span>
@@ -1970,7 +2852,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       : 'bg-black/85 hover:bg-white/15 border-white/15 text-slate-200'
                   }`}
                 >
-                  ⚙️
+                  SETUP
                 </button>
 
                 <button
@@ -2093,7 +2975,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             </div>
           </div>
 
-          {/* ==================== BOTTOM PERIMETER: FLOATING 2D TRACK MAP (LEFT) + TWIN-POD HALO TELEMETRY (CENTER) + F1 OSD BARS (RIGHT) ==================== */}
+          {/* ==================== BOTTOM PERIMETER: FLOATING 2D TRACK MAP (LEFT) + TWIN-POD HALO TELEMETRY (CENTER) + F1 OSD BARS & NEXT PIT TIRE SELECTOR (RIGHT) ==================== */}
           <div className="pointer-events-none flex flex-col gap-2 px-2 sm:px-5 pb-2 sm:pb-3">
             {/* Mobile Ergonomic Touch Controls (< md screens) */}
             <div className="pointer-events-auto flex items-center justify-between gap-1.5 w-full md:hidden">
@@ -2194,9 +3076,9 @@ export const GameHud: React.FC<GameHudProps> = ({
               </div>
             </div>
 
-            {/* Bottom 3-Zone F1 25 Layout: [Bottom-Left Floating Track Map] — [Bottom-Center Twin-Pod Halo Cluster] — [Bottom-Right OSD Sliders & Pit Button] */}
+            {/* Bottom 3-Zone F1 25 Layout: [Bottom-Left Floating Track Map] — [Bottom-Center Twin-Pod Halo Cluster] — [Bottom-Right OSD Sliders & In-Flight Pit Tire Radio] */}
             <div className="flex items-end justify-between gap-2">
-              {/* BOTTOM-LEFT: Clean Floating 2D Circuit Map with Colored Sectors & Pit Lane (Exact match to image.png) */}
+              {/* BOTTOM-LEFT: Clean Floating 2D Circuit Map with Colored Sectors & Pit Lane */}
               <div className="pointer-events-auto relative hidden sm:block">
                 <svg
                   viewBox="0 0 150 150"
@@ -2220,7 +3102,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                     strokeLinecap="round"
                     strokeLinejoin="round"
                   />
-                  {/* Colored Sector Highlights (Purple / Green / Magenta like F1 TV Map) */}
+                  {/* Colored Sector Highlights */}
                   <path
                     d={minimap.s1Path}
                     fill="none"
@@ -2298,7 +3180,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       />
                     </g>
                   ))}
-                  {/* Player Arrow/Circle Marker (Bright Blue/Cyan like image.png) */}
+                  {/* Player Marker */}
                   <circle
                     ref={liveRefs.playerMapDot}
                     cx="75"
@@ -2321,16 +3203,18 @@ export const GameHud: React.FC<GameHudProps> = ({
                 </svg>
               </div>
 
-              {/* BOTTOM-CENTER: Official F1 Twin-Pod Halo / Steering Wheel Telemetry Cluster (Exact match to image.png) */}
+              {/* BOTTOM-CENTER: Official F1 Twin-Pod Halo / Steering Wheel Telemetry Cluster */}
               <div
-                className="pointer-events-auto mx-auto px-3 sm:px-5 py-2 sm:py-2.5 border border-white/15 shadow-2xl flex items-center gap-3 sm:gap-5"
+                className={`pointer-events-auto mx-auto px-3 sm:px-5 py-2 sm:py-2.5 border border-white/15 shadow-2xl flex items-center gap-3 sm:gap-5 transition-transform ${
+                  cameraMode === 'hood' ? 'scale-90 origin-bottom opacity-95' : ''
+                }`}
                 style={{
-                  backgroundColor: 'rgba(8, 11, 16, 0.92)',
+                  backgroundColor: 'rgba(8, 11, 16, 0.90)',
                   borderRadius: '28px 28px 14px 14px',
                   borderTop: '2px solid rgba(56, 189, 248, 0.45)',
                 }}
               >
-                {/* LEFT CIRCULAR POD: BAT / ERS 100% (Cyan Ring Gauge like image.png) */}
+                {/* LEFT CIRCULAR POD: BAT / ERS 100% */}
                 <div className="relative w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center shrink-0">
                   <svg viewBox="0 0 80 80" className="w-full h-full -rotate-90">
                     <circle
@@ -2372,7 +3256,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   </svg>
                 </div>
 
-                {/* CENTER GEAR & OVERTAKE MODE POD (N / 1..8 + MODO ADELANTAMIENTO / REŽIM PŘEDJÍŽDĚNÍ) */}
+                {/* CENTER GEAR & OVERTAKE MODE POD */}
                 <div className="flex flex-col items-center min-w-[110px] sm:min-w-[140px]">
                   {/* 15-LED Shift Light Strip */}
                   <div className="grid grid-cols-15 gap-0.5 h-1.5 w-full mb-1">
@@ -2393,7 +3277,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                     1
                   </span>
 
-                  {/* Bottom Overtake Mode / ERS Bar (MODO ADELANTAMIENTO style) */}
+                  {/* Bottom Overtake Mode / ERS Bar */}
                   <div className="w-full mt-1.5 bg-slate-900/95 border border-cyan-400/30 px-2 py-0.5 text-center">
                     <div className="text-[7px] sm:text-[8px] font-display font-bold uppercase tracking-[0.14em] text-slate-200 leading-tight">
                       REŽIM PŘEDJÍŽDĚNÍ
@@ -2408,7 +3292,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   </div>
                 </div>
 
-                {/* RIGHT CIRCULAR POD: KM/H & RPM (Magenta/Purple Tachometer Ring like image.png) */}
+                {/* RIGHT CIRCULAR POD: KM/H & RPM */}
                 <div className="relative w-16 h-16 sm:w-20 sm:h-20 flex items-center justify-center shrink-0">
                   <svg
                     viewBox="0 0 80 80"
@@ -2459,42 +3343,90 @@ export const GameHud: React.FC<GameHudProps> = ({
                 </div>
               </div>
 
-              {/* BOTTOM-RIGHT: F1 OSD Micro-Sliders (Brake Balance + Differential/Tires) & [ / (B) ] Pit Prompt (Exact match to image.png) */}
-              <div className="pointer-events-auto flex flex-col items-end gap-1 w-44 sm:w-60">
-                {/* Compact [ / (B) ] Box Prompt Badge */}
-                <button
-                  ref={liveRefs.pitZoneBanner}
-                  type="button"
-                  tabIndex={-1}
-                  aria-label="Vyžádat Pit Stop nebo vjet do boxu"
-                  title="Pit Stop — Zajeď do uličky v boxech nebo vyžádej BOX [B]"
-                  onClick={(e) => {
-                    e.currentTarget.blur();
-                    onEnterPitStop();
-                  }}
-                  className="px-2.5 py-1 bg-black/90 hover:bg-zinc-900 border border-white/20 text-white text-[11px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xl cursor-pointer"
-                  style={{
-                    clipPath:
-                      'polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px)',
-                  }}
-                >
-                  <span className="text-slate-400 font-mono-tabular">/</span>
-                  <span className="w-4 h-4 rounded-full border border-rose-500 text-rose-400 flex items-center justify-center text-[9px] font-bold">
-                    B
-                  </span>
-                  <span>BOX</span>
-                </button>
+              {/* BOTTOM-RIGHT: F1 OSD Micro-Sliders + In-Flight Pit Strategy Radio ([B] + [1-4] Next Pit Tire Selector) */}
+              <div
+                className={
+                  phase === 'pitstop'
+                    ? 'hidden'
+                    : 'pointer-events-auto flex flex-col items-end gap-1 w-48 sm:w-64'
+                }
+              >
+                {/* In-Flight Next Pit Tire Selector (Available anytime while driving, highlighted when Pit Radio [B] is active) */}
+                <div className="w-full p-2 bg-black/90 border border-white/20 shadow-xl">
+                  <div className="flex items-center justify-between gap-1.5 mb-1.5">
+                    <button
+                      ref={liveRefs.pitZoneBanner}
+                      type="button"
+                      tabIndex={-1}
+                      aria-label="Vyžádat Pit Stop nebo vjet do boxu"
+                      title="Pit Stop Rádio [B] — Vyžádat zastávku v boxech a vybrat směs příštího pit stopu (1-4)"
+                      onClick={(e) => {
+                        e.currentTarget.blur();
+                        onEnterPitStop();
+                      }}
+                      className="px-2 py-0.5 bg-black hover:bg-zinc-900 border border-white/25 text-white text-[10px] font-display font-bold uppercase tracking-wider flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <span className="w-3.5 h-3.5 rounded-full border border-rose-500 text-rose-400 flex items-center justify-center text-[8px] font-bold">
+                        B
+                      </span>
+                      <span>BOX RÁDIO</span>
+                    </button>
+                    <span className="text-[9px] font-mono-tabular text-slate-300 uppercase">
+                      Příští pneu:{' '}
+                      <strong
+                        style={{
+                          color: TIRE_COMPOUNDS[effectiveNextCompound].cssColor,
+                        }}
+                      >
+                        {TIRE_COMPOUNDS[effectiveNextCompound].shortCode}
+                      </strong>
+                    </span>
+                  </div>
 
-                {/* OSD Bar 1: Front Brake Bias / Aero Balance (Frenada delantera <> 57%) */}
-                <div
-                  className="w-full px-2.5 py-1 border-l-2 border-white bg-black/85 text-[10px] sm:text-[11px] flex items-center justify-between gap-2 relative overflow-hidden"
-                >
+                  {/* Quick 1-4 Tire Compound Pre-Select Buttons while driving */}
+                  <div className="grid grid-cols-4 gap-1">
+                    {ALL_COMPOUNDS.map((cid, idx) => {
+                      const info = TIRE_COMPOUNDS[cid];
+                      const isNext = effectiveNextCompound === cid;
+                      return (
+                        <button
+                          key={cid}
+                          type="button"
+                          tabIndex={-1}
+                          onClick={(e) => {
+                            e.currentTarget.blur();
+                            onSelectNextPitCompound?.(cid);
+                          }}
+                          title={`Předvolit ${info.name} pro příští Pit Stop [Klávesa ${
+                            idx + 1
+                          }]`}
+                          className={`py-1 px-1 border text-[9px] font-mono-tabular font-bold uppercase flex items-center justify-center gap-1 cursor-pointer transition ${
+                            isNext
+                              ? 'bg-white/20 border-white text-white shadow'
+                              : 'bg-black/70 border-white/10 text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          <span
+                            className="w-2.5 h-2.5 rounded-full border"
+                            style={{ borderColor: info.cssColor }}
+                          />
+                          <span>
+                            {idx + 1}:{info.shortCode}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* OSD Bar 1: Front Brake Bias / Aero Balance */}
+                <div className="w-full px-2.5 py-1 border-l-2 border-white bg-black/85 text-[10px] sm:text-[11px] flex items-center justify-between gap-2 relative overflow-hidden">
                   <div
                     className="absolute inset-y-0 left-0 bg-white/15 pointer-events-none"
                     style={{ width: '57%' }}
                   />
                   <span className="relative z-10 text-slate-200 font-medium truncate">
-                    ◐ Přední brzdy
+                    Přední brzdy
                   </span>
                   <div className="relative z-10 flex items-center gap-1 font-mono-tabular font-bold text-white shrink-0">
                     <span className="text-slate-400 text-[9px]">&lt;&gt;</span>
@@ -2502,10 +3434,8 @@ export const GameHud: React.FC<GameHudProps> = ({
                   </div>
                 </div>
 
-                {/* OSD Bar 2: Tire Wear & Differential Status (Diferencial <> 100% + 4-Wheel Wear) */}
-                <div
-                  className="w-full px-2.5 py-1 border-l-2 border-cyan-400 bg-black/85 text-[10px] sm:text-[11px] flex flex-col gap-1 relative overflow-hidden"
-                >
+                {/* OSD Bar 2: Tire Wear & Differential Status */}
+                <div className="w-full px-2.5 py-1 border-l-2 border-cyan-400 bg-black/85 text-[10px] sm:text-[11px] flex flex-col gap-1 relative overflow-hidden">
                   <div className="flex items-center justify-between gap-1.5">
                     <div className="flex items-center gap-1.5 truncate">
                       {/* Mini 4-Wheel Wear Matrix */}
@@ -2520,7 +3450,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                         ))}
                       </div>
                       <span className="text-slate-200 font-medium truncate">
-                        ⚙ Pneu {currentCompoundInfo.shortCode} ·{' '}
+                        Pneu {currentCompoundInfo.shortCode} ·{' '}
                         <span
                           ref={liveRefs.tireTempText}
                           className="font-mono-tabular text-amber-300"
@@ -2550,152 +3480,207 @@ export const GameHud: React.FC<GameHudProps> = ({
         </>
       )}
 
-      {/* ==================== INTERACTIVE PIT STOP MINIGAME MODAL (LIVE 3D PIT CREW VIEW + 4 COMPOUNDS) ==================== */}
+      {/* ==================== INTERACTIVE PIT STOP MINIGAME HUD (UNPAUSED LIVE RACE + 3D PIT CREW TELEMETRY) ==================== */}
       {phase === 'pitstop' && (
         <div
-          className="pointer-events-auto fixed inset-0 z-30 flex items-end justify-end p-2 sm:p-5"
+          className="pointer-events-auto fixed inset-0 z-30 flex flex-col justify-between p-2 sm:p-4"
           style={{
             background:
-              'linear-gradient(to left, rgba(4, 7, 14, 0.82) 0%, rgba(4, 7, 14, 0.18) 52%, rgba(4, 7, 14, 0.0) 100%)',
+              'linear-gradient(to left, rgba(4, 7, 14, 0.88) 0%, rgba(4, 7, 14, 0.35) 36%, rgba(4, 7, 14, 0.0) 64%)',
           }}
         >
-          <div
-            className="w-full max-w-[440px] p-3.5 sm:p-4 border border-white/20 shadow-2xl"
-            style={{
-              backgroundColor: 'rgba(10, 12, 16, 0.94)',
-              borderTop: '4px solid #e10600',
-            }}
-          >
-            <div className="flex items-center justify-between mb-2.5 pb-2 border-b border-white/10">
-              <div>
-                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-[#e10600]">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                  <span>FIA PIT BOX TELEMETRIE · VŮZ NA ZVEDÁCÍCH</span>
-                </div>
-                <h2 className="font-display text-lg sm:text-xl font-bold uppercase text-white">
-                  ZASTÁVKA V BOXECH (F1 2026 PIT STOP)
-                </h2>
+          {/* Top-Center FIA 5-Light Optical Pit Release Gantry & Live Pit Lane Telemetry Strip */}
+          <div className="mx-auto mt-12 sm:mt-2 px-4 py-2 bg-black/92 border border-white/20 border-t-4 border-t-[#e10600] shadow-2xl flex items-center gap-4 sm:gap-6">
+            <div>
+              <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-[0.2em] text-[#e10600]">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+                <span>FIA PIT LANE TELEMETRY · ZÁVOD BĚŽÍ V REÁLNÉM ČASE</span>
               </div>
-              <div className="text-right">
-                <div className="text-[10px] uppercase text-slate-400">
-                  Čas servisu (Cíl &lt; 2,4 s)
-                </div>
-                <div className="font-display text-2xl font-bold text-cyan-400 font-mono-tabular">
-                  {pitTotalSeconds.toFixed(2)} s
-                </div>
+              <div className="font-display text-sm sm:text-base font-bold uppercase text-white tracking-wider">
+                {pitWheelIndex >= 4
+                  ? 'ZELENÁ NA SEMAFORU — VŮZ SPUŠTĚN ZE ZVEDÁKŮ!'
+                  : `SERVIS PNEU PIRELLI (${pitWheelIndex}/4 KOLA UTAŽENA)`}
               </div>
             </div>
 
-            {/* FIA 5-Light Pit Release Gantry Bar */}
-            <div className="mb-3 px-3 py-1.5 bg-black/90 border border-white/15 flex items-center justify-between">
-              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-300">
-                {pitWheelIndex >= 4 ? '🟢 UVOLNĚNO — ZELENÁ!' : '🔴 ZVEDÁKY AKTIVNÍ'}
-              </span>
-              <div className="flex items-center gap-1.5">
-                {[0, 1, 2, 3, 4].map((lightIdx) => {
-                  const isGreen = pitWheelIndex >= 4;
-                  const isRed = !isGreen && lightIdx < pitWheelIndex;
-                  return (
-                    <span
-                      key={lightIdx}
-                      className={`w-3.5 h-3.5 rounded-full border border-white/20 transition-all ${
-                        isGreen
-                          ? 'bg-emerald-400 shadow-[0_0_8px_#22c55e]'
-                          : isRed
-                          ? 'bg-red-500 shadow-[0_0_8px_#ef4444]'
-                          : 'bg-zinc-800'
-                      }`}
-                    />
-                  );
-                })}
-              </div>
+            {/* FIA 5-Pod Pit Gantry Semaphore */}
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-950 border border-white/15">
+              {[0, 1, 2, 3, 4].map((lightIdx) => {
+                const isGreen = pitWheelIndex >= 4;
+                const isRed = !isGreen && lightIdx <= pitWheelIndex;
+                return (
+                  <span
+                    key={lightIdx}
+                    className={`w-4 h-4 rounded-full border border-white/25 transition-all ${
+                      isGreen
+                        ? 'bg-emerald-400 shadow-[0_0_12px_#22c55e]'
+                        : isRed
+                        ? 'bg-red-500 shadow-[0_0_10px_#ef4444]'
+                        : 'bg-zinc-800'
+                    }`}
+                  />
+                );
+              })}
             </div>
 
-            {/* Step 1: Select New Tire Compound (Soft, Medium, Hard, Wet) */}
-            <div className="mb-3">
-              <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-slate-300 mb-1.5">
-                <span>
-                  1. Zvol směs pneumatik Pirelli (klávesy 1–4 nebo dotyk):
-                </span>
-                <span className="text-amber-400 text-[11px]">
-                  {TIRE_COMPOUNDS[pitCompoundChoice].name}
-                </span>
+            <div className="text-right font-mono-tabular">
+              <div className="text-[9px] uppercase text-slate-400">
+                STÁNÍ V BOXU
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                {ALL_COMPOUNDS.map((cid, idx) => {
-                  const info = TIRE_COMPOUNDS[cid];
-                  const active = pitCompoundChoice === cid;
-                  return (
-                    <button
-                      key={cid}
-                      type="button"
-                      onClick={() => setPitCompoundChoice(cid)}
-                      className={`p-2 border text-left transition cursor-pointer ${
-                        active
-                          ? 'bg-white/15 border-white text-white shadow-lg'
-                          : 'bg-black/80 border-white/10 text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between mb-1">
-                        <div className="flex items-center gap-1.5 font-display font-bold text-xs uppercase">
-                          <span
-                            className="w-4 h-4 rounded-full border-2 flex items-center justify-center text-[9px] font-bold text-white shrink-0"
-                            style={{ borderColor: info.cssColor }}
-                          >
-                            {info.shortCode}
-                          </span>
-                          <span>
-                            {cid === 'soft'
-                              ? 'Měkká'
-                              : cid === 'medium'
-                              ? 'Střední'
-                              : cid === 'hard'
-                              ? 'Tvrdá'
-                              : 'Mokrá'}
-                          </span>
-                        </div>
-                        <span className="text-[9px] font-mono-tabular text-slate-500">
-                          [{idx + 1}]
+              <div className="font-display text-xl sm:text-2xl font-bold text-cyan-400 leading-none">
+                {pitTotalSeconds.toFixed(2)} s
+              </div>
+            </div>
+          </div>
+
+          {/* Right-Side F1 2026 Pit Crew Control Dock + 4-Wheel Monopost Schematic */}
+          <div className="ml-auto my-auto w-full max-w-[430px] p-3.5 sm:p-4 border border-white/20 shadow-2xl bg-[#080b11]/95 border-t-4 border-t-[#e10600]">
+            {/* Top-Down 4-Wheel F1 Monopost Pit Crew Schematic + Tire Compound Selector */}
+            <div className="grid grid-cols-12 gap-2.5 mb-3 items-center bg-black/85 p-2.5 border border-white/10">
+              {/* Left 5 Cols: Live Top-Down 4-Wheel F1 Car & Jack Schematic */}
+              <div className="col-span-5 relative flex flex-col items-center justify-center py-2 px-1 bg-slate-950/90 border border-white/10">
+                <div className="text-[8px] font-mono-tabular uppercase tracking-widest text-amber-400 mb-1">
+                  ▲ PŘEDNÍ ZVEDÁK
+                </div>
+                <div className="relative w-24 h-28 flex items-center justify-center">
+                  {/* F1 Monopost Carbon Nose, Sidepods & Rear Wing Silhouette */}
+                  <div className="w-5 h-24 bg-gradient-to-b from-[#e10600] via-slate-700 to-slate-900 border border-white/25 rounded-t-full" />
+                  <div className="absolute w-11 h-12 bg-slate-800/90 border border-cyan-400/30 rounded-xs" />
+                  {/* 4 Wheel Status Pods: 0=LP (FL), 1=PP (FR), 2=LZ (RL), 3=PZ (RR) */}
+                  {[
+                    { idx: 0, code: 'LP', posClass: 'top-1 left-0.5' },
+                    { idx: 1, code: 'PP', posClass: 'top-1 right-0.5' },
+                    { idx: 2, code: 'LZ', posClass: 'bottom-1 left-0.5' },
+                    { idx: 3, code: 'PZ', posClass: 'bottom-1 right-0.5' },
+                  ].map((w) => {
+                    const res = pitWheelResults[w.idx];
+                    const isCurrent = w.idx === pitWheelIndex;
+                    return (
+                      <div
+                        key={w.code}
+                        className={`absolute ${w.posClass} w-6 h-9 border flex flex-col items-center justify-center text-[8px] font-mono-tabular font-bold transition-all ${
+                          res === 'perfect'
+                            ? 'bg-emerald-500/35 border-emerald-400 text-emerald-200 shadow-[0_0_8px_rgba(34,197,94,0.6)]'
+                            : res === 'good'
+                            ? 'bg-amber-500/35 border-amber-400 text-amber-200'
+                            : res === 'slow'
+                            ? 'bg-rose-500/35 border-rose-400 text-rose-200'
+                            : isCurrent
+                            ? 'bg-cyan-500/35 border-cyan-300 text-white animate-pulse shadow-[0_0_10px_rgba(34,211,238,0.8)]'
+                            : 'bg-zinc-900 border-white/15 text-slate-500'
+                        }`}
+                      >
+                        <span>{w.code}</span>
+                        <span className="text-[7px]">
+                          {res ? 'OK' : isCurrent ? '⚡' : '··'}
                         </span>
                       </div>
+                    );
+                  })}
+                </div>
+                <div className="text-[8px] font-mono-tabular uppercase tracking-widest text-amber-400 mt-1">
+                  ▼ ZADNÍ ZVEDÁK
+                </div>
+              </div>
 
-                      <div className="space-y-0.5 text-[9px] font-mono-tabular mt-1">
+              {/* Right 7 Cols: 1-4 Pirelli Compound Selection */}
+              <div className="col-span-7">
+                <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-300 mb-1.5">
+                  <span>1. Směs Pirelli [1–4]:</span>
+                  <span
+                    className="font-mono-tabular"
+                    style={{
+                      color: TIRE_COMPOUNDS[pitCompoundChoice].cssColor,
+                    }}
+                  >
+                    {TIRE_COMPOUNDS[pitCompoundChoice].shortCode} ·{' '}
+                    {Math.round(
+                      TIRE_COMPOUNDS[pitCompoundChoice].gripMultiplier * 100
+                    )}
+                    % GRIP
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {ALL_COMPOUNDS.map((cid, idx) => {
+                    const info = TIRE_COMPOUNDS[cid];
+                    const active = pitCompoundChoice === cid;
+                    return (
+                      <button
+                        key={cid}
+                        type="button"
+                        onClick={() => {
+                          setPitCompoundChoice(cid);
+                          onSelectNextPitCompound?.(cid);
+                        }}
+                        className={`p-1.5 border text-left transition cursor-pointer ${
+                          active
+                            ? 'bg-white/15 border-white text-white shadow'
+                            : 'bg-black/80 border-white/10 text-slate-400 hover:text-white'
+                        }`}
+                      >
                         <div className="flex items-center justify-between">
-                          <span className="text-slate-400">Rychl.</span>
-                          <span
-                            className={
-                              cid === 'hard' ? 'text-amber-400' : 'text-white'
-                            }
-                          >
-                            {Math.round(info.topSpeedMultiplier * 100)}%
+                          <div className="flex items-center gap-1 font-display font-bold text-[11px] uppercase">
+                            <span
+                              className="w-3.5 h-3.5 rounded-full border-2 flex items-center justify-center text-[8px] font-bold text-white shrink-0"
+                              style={{ borderColor: info.cssColor }}
+                            >
+                              {info.shortCode}
+                            </span>
+                            <span>
+                              {cid === 'soft'
+                                ? 'Měkká'
+                                : cid === 'medium'
+                                ? 'Střední'
+                                : cid === 'hard'
+                                ? 'Tvrdá'
+                                : 'Mokrá'}
+                            </span>
+                          </div>
+                          <span className="text-[8px] font-mono-tabular text-slate-500">
+                            [{idx + 1}]
                           </span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <span className="text-slate-400">Grip</span>
-                          <span className="text-cyan-300">
-                            {cid === 'wet'
-                              ? '118% (Mokro)'
-                              : `${Math.round(info.gripMultiplier * 100)}%`}
+                        <div className="flex items-center justify-between text-[8px] font-mono-tabular text-slate-400 mt-1">
+                          <span>Rychl. {Math.round(info.topSpeedMultiplier * 100)}%</span>
+                          <span className="text-emerald-400">
+                            Výdrž {info.durabilityRating}%
                           </span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <span className="text-slate-400">Výdrž</span>
-                          <span className="text-emerald-400 font-bold">
-                            {info.durabilityRating}%
-                          </span>
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
-            {/* Step 2: 4-Wheel Pneumatic Gun Minigame */}
-            <div className="bg-black/90 p-3 border border-white/10 mb-3">
+            {/* Step 1B: F1 2026 Active Front Wing Flap Angle Adjustment */}
+            <div className="mb-2.5 px-2.5 py-1.5 bg-black/85 border border-white/10 flex items-center justify-between gap-2">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-slate-300">
+                Přítlak předního křídla (Z-Mode):
+              </div>
+              <div className="flex items-center gap-1">
+                {[2, 4, 6].map((deg) => (
+                  <button
+                    key={deg}
+                    type="button"
+                    onClick={() => setPitFrontWingAngle(deg)}
+                    className={`px-2 py-0.5 text-[10px] font-mono-tabular font-bold border cursor-pointer ${
+                      pitFrontWingAngle === deg
+                        ? 'bg-cyan-400 text-slate-950 border-cyan-300'
+                        : 'bg-black text-slate-400 border-white/15 hover:text-white'
+                    }`}
+                  >
+                    +{deg}° {deg === 2 ? '(Rychl.)' : deg === 4 ? '(Opt.)' : '(Zatáčky)'}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Step 2: 4-Wheel Paoli Hurricane Pneumatic Gun Minigame */}
+            <div className="bg-black/90 p-3 border border-white/15 mb-2.5">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-bold text-white">
-                  2. Utáhni matice kol ({Math.min(4, pitWheelIndex + 1)}/4):{' '}
+                  2. Pneumatická pistole Paoli ({Math.min(4, pitWheelIndex + 1)}/4):{' '}
                   <span className="text-amber-400">
                     {WHEEL_NAMES[Math.min(3, pitWheelIndex)]}
                   </span>
@@ -2705,14 +3690,14 @@ export const GameHud: React.FC<GameHudProps> = ({
                 </span>
               </div>
 
-              <div className="grid grid-cols-4 gap-2 mb-2.5">
+              <div className="grid grid-cols-4 gap-1.5 mb-2.5">
                 {WHEEL_NAMES.map((wLabel, idx) => {
                   const res = pitWheelResults[idx];
                   const isCurrent = idx === pitWheelIndex;
                   return (
                     <div
                       key={wLabel}
-                      className={`py-1 px-2 text-center border text-[11px] font-bold ${
+                      className={`py-1 px-1.5 text-center border text-[10px] font-bold ${
                         res === 'perfect'
                           ? 'bg-emerald-500/25 border-emerald-400 text-emerald-300'
                           : res === 'good'
@@ -2725,7 +3710,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                       }`}
                     >
                       <div>{wLabel.split(' ')[2]}</div>
-                      <div className="text-[9px] uppercase mt-0.5">
+                      <div className="text-[8px] uppercase mt-0.5">
                         {res === 'perfect'
                           ? 'PERFEKTNÍ'
                           : res === 'good'
@@ -2742,7 +3727,7 @@ export const GameHud: React.FC<GameHudProps> = ({
               </div>
 
               {/* Oscillating Pneumatic Torque Bar */}
-              <div className="relative w-full h-8 bg-zinc-900 border border-white/15 overflow-hidden mb-1.5">
+              <div className="relative w-full h-8 bg-zinc-900 border border-white/20 overflow-hidden mb-1.5">
                 <div
                   className="absolute top-0 bottom-0 bg-amber-500/30 border-x border-amber-400/50"
                   style={{ left: '24%', width: '56%' }}
@@ -2752,7 +3737,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                   style={{ left: '38%', width: '28%' }}
                 >
                   <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-200">
-                    ZELENÁ ZÓNA — IDEÁLNÍ MOMENT
+                    ZELENÁ ZÓNA — 3200 NM MOMENT
                   </span>
                 </div>
                 <div
@@ -2774,7 +3759,7 @@ export const GameHud: React.FC<GameHudProps> = ({
             >
               {pitWheelIndex >= 4
                 ? 'VŠECHNA KOLA HOTOVA — VYJÍŽDÍME Z BOXU!'
-                : `⚡ UTÁHNOUT MATICI (${WHEEL_NAMES[pitWheelIndex]}) [MEZERNÍK / DOTYK]`}
+                : `UTÁHNOUT MATICI (${WHEEL_NAMES[pitWheelIndex]}) [MEZERNÍK / DOTYK]`}
             </button>
           </div>
         </div>
@@ -2819,7 +3804,7 @@ export const GameHud: React.FC<GameHudProps> = ({
                 }}
                 className="w-full py-3 bg-white/10 hover:bg-white/15 border border-white/20 text-cyan-300 font-semibold cursor-pointer"
               >
-                🔧 Nouzový odtah do Pit Boxu (3D Servis pneu)
+                Nouzový odtah do Pit Boxu (3D Servis pneu)
               </button>
               <button
                 type="button"
@@ -2940,17 +3925,19 @@ export const GameHud: React.FC<GameHudProps> = ({
                       </span>
                     </div>
                     <span className="font-mono-tabular text-slate-300 shrink-0">
-                      {row.finished && row.finishTimeMs
+                      {row.eliminated
+                        ? 'VYŘAZEN'
+                        : row.finished && row.finishTimeMs
                         ? idx === 0
-                          ? `🏁 ${formatRaceTime(row.finishTimeMs)}`
+                          ? formatRaceTime(row.finishTimeMs)
                           : winnerTimeMs
-                          ? `🏁 +${Math.max(
+                          ? `+${Math.max(
                               0,
                               (row.finishTimeMs - winnerTimeMs) / 1000
                             )
                               .toFixed(3)
                               .replace('.', ',')} s`
-                          : `🏁 ${formatRaceTime(row.finishTimeMs)}`
+                          : formatRaceTime(row.finishTimeMs)
                         : `Kolo ${row.lap} · ${row.pitStopsCompleted ?? 0}× BOX`}
                     </span>
                   </div>
@@ -2980,3 +3967,4 @@ export const GameHud: React.FC<GameHudProps> = ({
     </div>
   );
 };
+

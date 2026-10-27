@@ -1,11 +1,25 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  let localFirebaseConfig: Record<string, string> | null = null;
+  const configPath = path.resolve(__dirname, 'firebase-applet-config.json');
+  if (fs.existsSync(configPath)) {
+    try {
+      localFirebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    } catch {
+      localFirebaseConfig = null;
+    }
+  }
+
   return {
     plugins: [react(), tailwindcss()],
+    define: {
+      __LOCAL_FIREBASE_CONFIG__: JSON.stringify(localFirebaseConfig),
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
